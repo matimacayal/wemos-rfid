@@ -169,39 +169,69 @@ void writeSaved(const String& json) {
 
 // ---- Wi-Fi credentials store ----------------------------------------------
 bool loadWifiCreds(String& ssid, String& pass) {
-  if (!LittleFS.exists(WIFI_FILE)) return false;
+  if (!LittleFS.exists(WIFI_FILE)) {
+    Serial.println(F("[WiFi] no saved creds"));
+    return false;
+  }
   File f = LittleFS.open(WIFI_FILE, "r");
-  if (!f) return false;
+  if (!f) {
+    Serial.println(F("[WiFi] failed to open creds file"));
+    return false;
+  }
   ssid = f.readStringUntil('\n'); ssid.trim();
   pass = f.readStringUntil('\n'); pass.trim();
   f.close();
-  return ssid.length() > 0;
+  if (ssid.length() == 0) {
+    Serial.println(F("[WiFi] creds file empty"));
+    return false;
+  }
+  Serial.printf("[WiFi] loaded creds for SSID '%s' (pass len=%u)\n",
+                ssid.c_str(), (unsigned)pass.length());
+  return true;
 }
 
 void saveWifiCreds(const String& ssid, const String& pass) {
   File f = LittleFS.open(WIFI_FILE, "w");
-  if (!f) return;
+  if (!f) {
+    Serial.println(F("[WiFi] failed to open creds file for write"));
+    return;
+  }
   f.println(ssid);
   f.println(pass);
   f.close();
+  Serial.printf("[WiFi] credentials saved for '%s' (pass len=%u)\n",
+                ssid.c_str(), (unsigned)pass.length());
 }
 
 void clearWifiCreds() {
   LittleFS.remove(WIFI_FILE);
+  Serial.println(F("[WiFi] credentials cleared"));
 }
 
 bool tryConnectSTA(const String& ssid, const String& pass) {
   WiFi.mode(WIFI_STA);
   WiFi.hostname(MDNS_HOST);
   WiFi.begin(ssid.c_str(), pass.c_str());
-  Serial.printf("[STA] connecting to '%s'", ssid.c_str());
+  Serial.printf("[STA] connecting to '%s' (timeout %lu ms)", ssid.c_str(),
+                (unsigned long)STA_CONNECT_TIMEOUT_MS);
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < STA_CONNECT_TIMEOUT_MS) {
     delay(250);
     Serial.print('.');
   }
   Serial.println();
-  return WiFi.status() == WL_CONNECTED;
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[STA] connected in %lu ms: IP=%s RSSI=%d dBm BSSID=%s ch=%d\n",
+                  millis() - start,
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.RSSI(),
+                  WiFi.BSSIDstr().c_str(),
+                  WiFi.channel());
+    return true;
+  }
+  Serial.printf("[STA] connect failed after %lu ms (status=%d)\n",
+                millis() - start, WiFi.status());
+  return false;
 }
 
 String htmlEscape(const String& in) {
@@ -236,6 +266,13 @@ String dumpClassic1K() {
   MFRC522::MIFARE_Key key;
   for (uint8_t i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
 
+  Serial.printf("[DUMP] start: UID=%s SAK=0x%02X type='%s'\n",
+                bytesToHex(mfrc.uid.uidByte, mfrc.uid.size).c_str(),
+                mfrc.uid.sak,
+                picctypeName(mfrc.PICC_GetType(mfrc.uid.sak)).c_str());
+  uint32_t t0 = millis();
+  uint8_t okSectors = 0, badSectors = 0;
+
   out += "UID:  " + bytesToHex(mfrc.uid.uidByte, mfrc.uid.size, true) + "\n";
   out += "SAK:  0x" + String(mfrc.uid.sak, HEX) + "\n";
   out += "Type: " + picctypeName(mfrc.PICC_GetType(mfrc.uid.sak)) + "\n\n";
@@ -244,21 +281,30 @@ String dumpClassic1K() {
     uint8_t trailer = sector * 4 + 3;
     auto status = mfrc.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailer, &key, &mfrc.uid);
     if (status != MFRC522::STATUS_OK) {
+      Serial.printf("[DUMP] S%-2u auth failed (default key A)\n", sector);
       out += "S" + String(sector) + ": auth failed (default key A)\n";
+      badSectors++;
       continue;
     }
+    Serial.printf("[DUMP] S%-2u auth ok\n", sector);
+    okSectors++;
     for (uint8_t blk = sector * 4; blk <= trailer; blk++) {
       uint8_t buf[18]; uint8_t sz = sizeof(buf);
       auto rs = mfrc.MIFARE_Read(blk, buf, &sz);
       if (rs == MFRC522::STATUS_OK) {
-        out += "  blk " + String(blk) + ": " + bytesToHex(buf, 16, true) + "\n";
+        String hex = bytesToHex(buf, 16, true);
+        Serial.printf("[DUMP]   blk %2u: %s\n", blk, hex.c_str());
+        out += "  blk " + String(blk) + ": " + hex + "\n";
       } else {
+        Serial.printf("[DUMP]   blk %2u: read error\n", blk);
         out += "  blk " + String(blk) + ": read error\n";
       }
     }
   }
   mfrc.PICC_HaltA();
   mfrc.PCD_StopCrypto1();
+  Serial.printf("[DUMP] done in %lu ms (auth ok=%u, fail=%u)\n",
+                millis() - t0, okSectors, badSectors);
   return out;
 }
 
@@ -266,11 +312,21 @@ bool writeBlockClassic(uint8_t block, const uint8_t* data16) {
   MFRC522::MIFARE_Key key;
   for (uint8_t i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
   uint8_t trailer = (block / 4) * 4 + 3;
+  Serial.printf("[WRITE-BLK] block=%u (sector=%u trailer=%u) data=%s\n",
+                block, block / 4, trailer,
+                bytesToHex(data16, 16, true).c_str());
   auto status = mfrc.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailer, &key, &mfrc.uid);
-  if (status != MFRC522::STATUS_OK) return false;
+  if (status != MFRC522::STATUS_OK) {
+    Serial.printf("[WRITE-BLK] auth failed (status=%d) on trailer %u\n", status, trailer);
+    mfrc.PICC_HaltA();
+    mfrc.PCD_StopCrypto1();
+    return false;
+  }
   status = mfrc.MIFARE_Write(block, (uint8_t*)data16, 16);
   mfrc.PICC_HaltA();
   mfrc.PCD_StopCrypto1();
+  Serial.printf("[WRITE-BLK] %s (status=%d)\n",
+                status == MFRC522::STATUS_OK ? "OK" : "FAILED", status);
   return status == MFRC522::STATUS_OK;
 }
 
@@ -526,6 +582,8 @@ String escJson(const String& in) {
 }
 
 void handleRoot() {
+  Serial.printf("[HTTP] GET / from %s\n",
+                server.client().remoteIP().toString().c_str());
   server.sendHeader("Connection", "close");
   server.send_P(200, "text/html", INDEX_HTML);
 }
@@ -549,8 +607,14 @@ void handleStatus() {
 }
 
 void handleCmd() {
-  if (!server.hasArg("plain")) { sendJson(400, "{\"ok\":false,\"message\":\"missing body\"}"); return; }
+  if (!server.hasArg("plain")) {
+    Serial.println(F("[HTTP] POST /api/cmd: missing body -> 400"));
+    sendJson(400, "{\"ok\":false,\"message\":\"missing body\"}");
+    return;
+  }
   String body = server.arg("plain");
+  Serial.printf("[HTTP] POST /api/cmd from %s body=%s\n",
+                server.client().remoteIP().toString().c_str(), body.c_str());
 
   auto field = [&](const char* k) -> String {
     String key = String("\"") + k + "\"";
@@ -573,12 +637,14 @@ void handleCmd() {
   String cmd = field("cmd");
 
   if (cmd == "read") {
+    Serial.println(F("[CMD] read: arming for next card"));
     op.mode = MODE_IDLE;
     op.lastResult = "Place a card on the reader.";
     sendJson(200, "{\"ok\":true,\"message\":\"Place a card on the reader.\"}");
     return;
   }
   if (cmd == "dump") {
+    Serial.println(F("[CMD] dump: arming for next card"));
     op.mode = MODE_DUMP;
     op.lastResult = "Place a MIFARE Classic 1K card to dump.";
     sendJson(200, "{\"ok\":true,\"message\":\"Place a card to dump.\"}");
@@ -586,20 +652,24 @@ void handleCmd() {
   }
   if (cmd == "save") {
     if (op.lastUidHex.length() == 0) {
+      Serial.println(F("[CMD] save: no UID read yet"));
       sendJson(200, "{\"ok\":false,\"message\":\"No UID read yet.\"}"); return;
     }
     String saved = loadSaved();
     if (saved.indexOf("\"" + op.lastUidHex + "\"") >= 0) {
+      Serial.printf("[CMD] save: UID %s already in library\n", op.lastUidHex.c_str());
       sendJson(200, "{\"ok\":false,\"message\":\"Already saved.\"}"); return;
     }
     if (saved == "[]") saved = "[\"" + op.lastUidHex + "\"]";
     else { saved.remove(saved.length() - 1); saved += ",\"" + op.lastUidHex + "\"]"; }
     writeSaved(saved);
+    Serial.printf("[CMD] save: UID %s added to library\n", op.lastUidHex.c_str());
     sendJson(200, "{\"ok\":true,\"message\":\"Saved.\"}");
     return;
   }
   if (cmd == "forget") {
     int idx = field("index").toInt();
+    Serial.printf("[CMD] forget index=%d\n", idx);
     String saved = loadSaved();
     int count = 0, start = -1, end = -1, depth = 0;
     for (size_t i = 0; i < saved.length(); i++) {
@@ -609,23 +679,29 @@ void handleCmd() {
       }
     }
     if (start >= 0 && end > start) {
+      String removed = saved.substring(start + 1, end);
       String before = saved.substring(0, start);
       String after  = saved.substring(end + 1);
       // strip the comma separator on whichever side
       if (before.endsWith(",")) before.remove(before.length() - 1);
       else if (after.startsWith(",")) after.remove(0, 1);
       writeSaved(before + after);
+      Serial.printf("[CMD] forget: removed UID %s\n", removed.c_str());
+    } else {
+      Serial.printf("[CMD] forget: index %d not found\n", idx);
     }
     sendJson(200, "{\"ok\":true,\"message\":\"Removed.\"}");
     return;
   }
   if (cmd == "clone-start") {
+    Serial.println(F("[CMD] clone-start: waiting for SOURCE card"));
     op.mode = MODE_CLONE_READ_SRC;
     op.lastResult = "Place SOURCE card to read its UID.";
     sendJson(200, "{\"ok\":true,\"message\":\"Place SOURCE card.\"}");
     return;
   }
   if (cmd == "cancel") {
+    Serial.printf("[CMD] cancel (was mode=%d)\n", (int)op.mode);
     op.mode = MODE_IDLE;
     op.pendingUidLen = 0;
     op.lastResult = "Cancelled.";
@@ -633,9 +709,9 @@ void handleCmd() {
     return;
   }
   if (cmd == "wifi-forget") {
+    Serial.println(F("[CMD] wifi-forget: clearing creds and restarting"));
     clearWifiCreds();
     sendJson(200, "{\"ok\":true,\"message\":\"Wi-Fi forgotten. Rebooting.\"}");
-    Serial.println(F("[WiFi] credentials cleared, restarting"));
     delay(400);
     ESP.restart();
     return;
@@ -644,12 +720,15 @@ void handleCmd() {
     String uid = field("uid");
     uint8_t buf[10]; uint8_t len = 0;
     if (!hexToBytes(uid, buf, sizeof(buf), len) || (len != 4 && len != 7)) {
+      Serial.printf("[CMD] write-uid rejected: bad UID '%s'\n", uid.c_str());
       sendJson(200, "{\"ok\":false,\"message\":\"UID must be 4 or 7 hex bytes.\"}"); return;
     }
     memcpy(op.pendingUid, buf, len);
     op.pendingUidLen = len;
     op.mode = MODE_WRITE_UID;
     op.lastResult = "Place magic card to write UID " + bytesToHex(buf, len) + ".";
+    Serial.printf("[CMD] write-uid: queued UID %s (%u bytes), waiting for magic card\n",
+                  bytesToHex(buf, len).c_str(), len);
     sendJson(200, "{\"ok\":true,\"message\":\"Place magic card.\"}");
     return;
   }
@@ -658,23 +737,33 @@ void handleCmd() {
     String data = field("data");
     uint8_t buf[16]; uint8_t len = 0;
     if (!hexToBytes(data, buf, sizeof(buf), len) || len != 16) {
+      Serial.printf("[CMD] write-block rejected: bad data '%s' (len=%u)\n",
+                    data.c_str(), len);
       sendJson(200, "{\"ok\":false,\"message\":\"Data must be exactly 16 bytes.\"}"); return;
     }
     if (blk < 1 || blk > 62 || blk % 4 == 3) {
+      Serial.printf("[CMD] write-block rejected: bad block %d\n", blk);
       sendJson(200, "{\"ok\":false,\"message\":\"Block must be 1..62 and not a sector trailer.\"}"); return;
     }
     op.pendingBlock = blk;
     memcpy(op.pendingData, buf, 16);
     op.mode = MODE_WRITE_BLOCK;
     op.lastResult = "Place card to write block " + String(blk) + ".";
+    Serial.printf("[CMD] write-block: queued blk=%d data=%s, waiting for card\n",
+                  blk, bytesToHex(buf, 16, true).c_str());
     sendJson(200, "{\"ok\":true,\"message\":\"Place card.\"}");
     return;
   }
 
+  Serial.printf("[CMD] unknown command '%s'\n", cmd.c_str());
   sendJson(200, "{\"ok\":false,\"message\":\"Unknown command\"}");
 }
 
 void handleNotFound() {
+  Serial.printf("[HTTP] 404 %s %s from %s\n",
+                server.method() == HTTP_GET ? "GET" : "POST",
+                server.uri().c_str(),
+                server.client().remoteIP().toString().c_str());
   server.send(404, "text/plain", "Not found");
 }
 
@@ -682,6 +771,8 @@ void handleWifiSaved() {
   // Returns a JSON array — single element today (we only persist one set of
   // creds), but shaped for future multi-network support. Includes the password
   // in plaintext, consistent with the rest of the unauthenticated API.
+  Serial.printf("[HTTP] GET /api/wifi-saved from %s\n",
+                server.client().remoteIP().toString().c_str());
   String ssid, pass;
   String json = "[";
   if (loadWifiCreds(ssid, pass)) {
@@ -696,7 +787,11 @@ void handleWifiScan() {
   // ESP8266 needs the STA radio active for scanNetworks(). In NET_SETUP_AP we
   // already brought the chip up in WIFI_AP_STA so this just works; in station
   // mode we're already STA.
+  Serial.printf("[HTTP] GET /api/wifi-scan from %s\n",
+                server.client().remoteIP().toString().c_str());
+  uint32_t t0 = millis();
   int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
+  Serial.printf("[WiFi] scan returned %d networks in %lu ms\n", n, millis() - t0);
   String json = "[";
   for (int i = 0; i < n; i++) {
     if (i) json += ',';
@@ -704,6 +799,9 @@ void handleWifiScan() {
     json += ",\"rssi\":" + String(WiFi.RSSI(i));
     json += ",\"enc\":" + String(WiFi.encryptionType(i) != ENC_TYPE_NONE ? "true" : "false");
     json += "}";
+    Serial.printf("[WiFi]   %2d) %-32s %4d dBm %s\n", i,
+                  WiFi.SSID(i).c_str(), WiFi.RSSI(i),
+                  WiFi.encryptionType(i) != ENC_TYPE_NONE ? "secured" : "open");
   }
   json += "]";
   WiFi.scanDelete();
@@ -711,15 +809,18 @@ void handleWifiScan() {
 }
 
 void handleWifiSave() {
+  Serial.printf("[HTTP] POST /api/wifi-save from %s\n",
+                server.client().remoteIP().toString().c_str());
   String ssid = server.arg("ssid");
   String pass = server.arg("pass");
   ssid.trim();
   if (ssid.length() == 0) {
+    Serial.println(F("[WiFi] save rejected: SSID required"));
     server.send(400, "text/plain", "SSID required");
     return;
   }
   saveWifiCreds(ssid, pass);
-  Serial.printf("[WiFi] saved creds for '%s', restarting\n", ssid.c_str());
+  Serial.printf("[WiFi] reboot to join '%s'\n", ssid.c_str());
   String safeSsid = htmlEscape(ssid);
   String body =
     "<!doctype html><html><head><meta charset=utf-8>"
@@ -749,6 +850,9 @@ void processCard() {
 
   // Always refresh "current card" info regardless of mode
   readCardSummary();
+  Serial.printf("[RFID] card: UID=%s SAK=0x%02X type='%s' (mode=%d)\n",
+                op.lastUidHex.c_str(), mfrc.uid.sak,
+                op.lastCardType.c_str(), (int)op.mode);
 
   switch (op.mode) {
     case MODE_IDLE:
@@ -765,6 +869,8 @@ void processCard() {
         // (UI fetches dump via the same /api/cmd response if requested; here we
         //  return inline via a follow-up status — keep it simple: send through cmd)
       } else {
+        Serial.printf("[DUMP] skipped: card type '%s' not MIFARE Classic\n",
+                      op.lastCardType.c_str());
         op.lastResult = "Dump only supported for MIFARE Classic.";
       }
       op.mode = MODE_IDLE;
@@ -773,22 +879,34 @@ void processCard() {
     case MODE_CLONE_READ_SRC:
       memcpy(op.pendingUid, mfrc.uid.uidByte, mfrc.uid.size);
       op.pendingUidLen = mfrc.uid.size;
+      Serial.printf("[CLONE] source captured: UID=%s (%u bytes), now waiting for TARGET\n",
+                    op.lastUidHex.c_str(), op.pendingUidLen);
       op.lastResult = "Source UID " + op.lastUidHex + " captured. Now place TARGET (magic) card.";
       op.mode = MODE_CLONE_WRITE_DST;
       break;
 
     case MODE_CLONE_WRITE_DST:
     case MODE_WRITE_UID: {
+      const char* tag = (op.mode == MODE_CLONE_WRITE_DST) ? "CLONE" : "WRITE-UID";
       if (op.pendingUidLen != 4) {
+        Serial.printf("[%s] aborted: pending UID is %u bytes, need 4 for magic card\n",
+                      tag, op.pendingUidLen);
         op.lastResult = "Magic-card UID write requires a 4-byte UID.";
         op.mode = MODE_IDLE;
         break;
       }
+      Serial.printf("[%s] writing UID %s to target (current UID %s)\n",
+                    tag,
+                    bytesToHex(op.pendingUid, op.pendingUidLen).c_str(),
+                    op.lastUidHex.c_str());
       bool ok = mfrc.MIFARE_SetUid(op.pendingUid, op.pendingUidLen, true);
       if (ok) {
+        Serial.printf("[%s] OK — UID %s written\n",
+                      tag, bytesToHex(op.pendingUid, op.pendingUidLen).c_str());
         op.lastResult = "UID written: " + bytesToHex(op.pendingUid, op.pendingUidLen) +
                         ". Re-tap to verify.";
       } else {
+        Serial.printf("[%s] FAILED — likely not a magic Gen1A card\n", tag);
         op.lastResult = "Write failed. Card likely not a magic Gen1A card.";
       }
       op.mode = MODE_IDLE;

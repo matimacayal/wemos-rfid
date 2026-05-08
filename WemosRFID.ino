@@ -48,10 +48,11 @@ constexpr uint8_t  SS_PIN    = 15;         // D8
 const char*  AP_SSID         = "WemosRFID";
 const char*  AP_PASS         = "rfidwemos"; // 8+ chars required by WPA2
 const char*  MDNS_HOST       = "wemosrfid";
-const char*  SAVED_FILE      = "/saved.json";
+const char*  SAVED_TXT       = "/saved.txt"; // paired lines: uid1, name1, uid2, name2, ...
 const char*  WIFI_FILE       = "/wifi.txt";  // paired lines: ssid1, pass1, ssid2, pass2, ...
 constexpr uint32_t STA_CONNECT_TIMEOUT_MS = 15000;  // per-network connect timeout
 constexpr uint8_t  MAX_WIFI_CREDS = 4;              // max saved networks
+constexpr uint8_t  MAX_SAVED_UIDS = 32;             // max saved UIDs in library
 
 // ---- Globals ---------------------------------------------------------------
 MFRC522 mfrc(SS_PIN, RST_PIN);
@@ -92,6 +93,26 @@ struct WifiCred {
 };
 WifiCred wifiCache[MAX_WIFI_CREDS];
 uint8_t  wifiCacheN = 0;
+
+struct SavedUid {
+  String uid;
+  String name;
+};
+SavedUid savedCache[MAX_SAVED_UIDS];
+uint8_t  savedCacheN = 0;
+
+// ---- Status LED ------------------------------------------------------------
+// Onboard LED is on GPIO2 / D4 (active LOW: LOW = on, HIGH = off). Exposed as
+// LED_BUILTIN by the ESP8266 core.
+enum LedMode : uint8_t {
+  LED_OFF = 0,     // explicitly off (used briefly during boot)
+  LED_CONNECTING,  // 100/100 ms — fast blink while attempting saved networks
+  LED_STATION,     // 60/2940 ms — sparse heartbeat once joined
+  LED_AP           // 500/500 ms — even 1 Hz blink while hosting setup hotspot
+};
+LedMode  ledMode       = LED_OFF;
+uint32_t ledPhaseStart = 0;
+uint8_t  ledPhaseIdx   = 0; // 0 = "on" half of cycle, 1 = "off" half
 
 // ---- Helpers ---------------------------------------------------------------
 String bytesToHex(const uint8_t* buf, uint8_t len, bool spaced = false) {
@@ -158,21 +179,168 @@ bool waitForCard(uint16_t timeoutMs = 0) {
 }
 
 // ---- Persistent saved-UID library -----------------------------------------
-String loadSaved() {
-  if (!LittleFS.exists(SAVED_FILE)) return "[]";
-  File f = LittleFS.open(SAVED_FILE, "r");
-  if (!f) return "[]";
-  String s = f.readString();
+// File format: paired lines (uid1, name1, uid2, name2, ...). Same rationale as
+// /wifi.txt — no JSON parser, tolerant of `"` and `\` in names. Names cannot
+// contain `\n` (line-delimited), and the field() request parser cannot handle
+// `"` inside names because it does not understand JSON escapes.
+bool loadAllSaved(SavedUid* out, uint8_t maxN, uint8_t& outN) {
+  outN = 0;
+  if (!LittleFS.exists(SAVED_TXT)) return false;
+  File f = LittleFS.open(SAVED_TXT, "r");
+  if (!f) return false;
+  while (f.available() && outN < maxN) {
+    String u = f.readStringUntil('\n'); u.trim();
+    String n = f.readStringUntil('\n'); n.trim();
+    if (u.length() == 0) continue;
+    out[outN].uid = u;
+    out[outN].name = n;
+    outN++;
+  }
   f.close();
-  if (s.length() == 0) return "[]";
-  return s;
+  Serial.printf("[SAVED] loaded %u saved UID(s)\n", outN);
+  return outN > 0;
 }
 
-void writeSaved(const String& json) {
-  File f = LittleFS.open(SAVED_FILE, "w");
-  if (!f) return;
-  f.print(json);
+void saveAllSaved(const SavedUid* arr, uint8_t n) {
+  if (n == 0) {
+    LittleFS.remove(SAVED_TXT);
+    Serial.println(F("[SAVED] file removed (empty list)"));
+    return;
+  }
+  File f = LittleFS.open(SAVED_TXT, "w");
+  if (!f) {
+    Serial.println(F("[SAVED] failed to open file for write"));
+    return;
+  }
+  for (uint8_t i = 0; i < n; i++) {
+    f.println(arr[i].uid);
+    f.println(arr[i].name);
+  }
   f.close();
+  Serial.printf("[SAVED] wrote %u saved UID(s)\n", n);
+}
+
+void syncSavedCache() {
+  loadAllSaved(savedCache, MAX_SAVED_UIDS, savedCacheN);
+}
+
+// Returns 1 = added, 0 = already exists (no-op), -1 = list full.
+int addSavedUid(const String& uid, const String& name) {
+  for (uint8_t i = 0; i < savedCacheN; i++) {
+    if (savedCache[i].uid == uid) {
+      Serial.printf("[SAVED] UID %s already in library\n", uid.c_str());
+      return 0;
+    }
+  }
+  if (savedCacheN >= MAX_SAVED_UIDS) {
+    Serial.printf("[SAVED] cannot add %s: list full (%u/%u)\n",
+                  uid.c_str(), savedCacheN, MAX_SAVED_UIDS);
+    return -1;
+  }
+  savedCache[savedCacheN].uid  = uid;
+  savedCache[savedCacheN].name = name;
+  savedCacheN++;
+  saveAllSaved(savedCache, savedCacheN);
+  Serial.printf("[SAVED] added UID %s (name='%s', now %u/%u)\n",
+                uid.c_str(), name.c_str(), savedCacheN, MAX_SAVED_UIDS);
+  return 1;
+}
+
+bool removeSavedAt(uint8_t idx) {
+  if (idx >= savedCacheN) {
+    Serial.printf("[SAVED] remove index %u out of range (%u saved)\n",
+                  idx, savedCacheN);
+    return false;
+  }
+  String removed = savedCache[idx].uid;
+  for (uint8_t i = idx; i + 1 < savedCacheN; i++) savedCache[i] = savedCache[i + 1];
+  savedCacheN--;
+  savedCache[savedCacheN].uid  = "";
+  savedCache[savedCacheN].name = "";
+  saveAllSaved(savedCache, savedCacheN);
+  Serial.printf("[SAVED] removed UID %s (now %u/%u)\n",
+                removed.c_str(), savedCacheN, MAX_SAVED_UIDS);
+  return true;
+}
+
+bool renameSavedAt(uint8_t idx, const String& name) {
+  if (idx >= savedCacheN) {
+    Serial.printf("[SAVED] rename index %u out of range (%u saved)\n",
+                  idx, savedCacheN);
+    return false;
+  }
+  savedCache[idx].name = name;
+  saveAllSaved(savedCache, savedCacheN);
+  Serial.printf("[SAVED] renamed [%u] %s -> '%s'\n",
+                idx, savedCache[idx].uid.c_str(), name.c_str());
+  return true;
+}
+
+// One-shot migration from old /saved.json (JSON array of UID strings) to the
+// new paired-line /saved.txt. Runs at boot before syncSavedCache(); idempotent
+// (skips if /saved.txt already exists).
+void migrateSavedJsonIfPresent() {
+  const char* OLD = "/saved.json";
+  if (!LittleFS.exists(OLD)) return;
+  if (LittleFS.exists(SAVED_TXT)) {
+    LittleFS.remove(OLD);
+    Serial.println(F("[SAVED] /saved.txt already present; removed leftover /saved.json"));
+    return;
+  }
+  File f = LittleFS.open(OLD, "r");
+  if (!f) return;
+  String s = f.readString();
+  f.close();
+  Serial.println(F("[SAVED] migrating /saved.json -> /saved.txt"));
+  SavedUid tmp[MAX_SAVED_UIDS];
+  uint8_t  n = 0;
+  int i = 0;
+  while (i < (int)s.length() && n < MAX_SAVED_UIDS) {
+    int q1 = s.indexOf('"', i);
+    if (q1 < 0) break;
+    int q2 = s.indexOf('"', q1 + 1);
+    if (q2 < 0) break;
+    tmp[n].uid  = s.substring(q1 + 1, q2);
+    tmp[n].name = "";
+    n++;
+    i = q2 + 1;
+  }
+  if (n > 0) saveAllSaved(tmp, n);
+  LittleFS.remove(OLD);
+  Serial.printf("[SAVED] migrated %u UID(s)\n", n);
+}
+
+// ---- Status LED helpers ---------------------------------------------------
+void setLedMode(LedMode m) {
+  if (m == ledMode) return;
+  ledMode       = m;
+  ledPhaseStart = millis();
+  ledPhaseIdx   = 0;
+  if (m == LED_OFF) {
+    digitalWrite(LED_BUILTIN, HIGH); // off
+  } else {
+    digitalWrite(LED_BUILTIN, LOW);  // on (start of "on" half)
+  }
+}
+
+// Non-blocking. Call frequently from loop() and also from inside the blocking
+// connect wait so the LED stays animated during station-join attempts.
+void updateLed() {
+  if (ledMode == LED_OFF) return;
+  uint16_t onMs, offMs;
+  switch (ledMode) {
+    case LED_CONNECTING: onMs = 100; offMs = 100;  break;
+    case LED_STATION:    onMs = 60;  offMs = 2940; break;
+    case LED_AP:         onMs = 500; offMs = 500;  break;
+    default: return;
+  }
+  uint32_t now = millis();
+  uint16_t dur = (ledPhaseIdx == 0) ? onMs : offMs;
+  if (now - ledPhaseStart >= dur) {
+    ledPhaseStart = now;
+    ledPhaseIdx  ^= 1;
+    digitalWrite(LED_BUILTIN, ledPhaseIdx == 0 ? LOW : HIGH);
+  }
 }
 
 // ---- Wi-Fi credentials store ----------------------------------------------
@@ -290,9 +458,11 @@ bool tryConnectSTA(const String& ssid, const String& pass) {
   Serial.printf("[STA] connecting to '%s' (timeout %lu ms)", ssid.c_str(),
                 (unsigned long)STA_CONNECT_TIMEOUT_MS);
   uint32_t start = millis();
+  uint32_t lastDot = start;
   while (WiFi.status() != WL_CONNECTED && millis() - start < STA_CONNECT_TIMEOUT_MS) {
-    delay(250);
-    Serial.print('.');
+    delay(20);
+    updateLed();
+    if (millis() - lastDot >= 250) { Serial.print('.'); lastDot = millis(); }
   }
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
@@ -533,9 +703,15 @@ footer{padding:16px;color:var(--mut);text-align:center;font-size:12px}
     <div class="row">
       <button class="primary" onclick="cmd('read')">Read UID</button>
       <button onclick="cmd('dump')">Full Memory Dump (MIFARE 1K)</button>
-      <button onclick="cmd('save')">Save UID to library</button>
+      <button onclick="saveUid()">Save UID to library</button>
+    </div>
+    <!--
+    <div class="row" style="margin-top:6px">
+      <button onclick="saveUid()">Save UID to library</button>
+      <input id="saveName" type="text" placeholder="optional name (e.g. home key)" style="flex:1" maxlength="40"/>
     </div>
     <pre id="dump" style="display:none"></pre>
+    -->
   </div>
 
   <div class="card">
@@ -626,6 +802,15 @@ async function cmd(name){
   const r = await api('/api/cmd', {cmd:name});
   flash(r.message || 'OK', !r.ok);
   if(r.dump){ dumpEl.style.display='block'; dumpEl.textContent = r.dump; }
+}
+async function saveUid(){
+  const nameEl = document.getElementById('saveName');
+  // Names are stored line-delimited and sent through a naive JSON parser, so
+  // strip newlines and double quotes here to keep round-trips clean.
+  const name = nameEl.value.replace(/[\r\n"]/g, '').trim();
+  const r = await api('/api/cmd', {cmd:'save', name:name});
+  flash(r.message || 'OK', !r.ok);
+  if (r.ok) nameEl.value = '';
 }
 async function writeUid(){
   const v = document.getElementById('uidIn').value.trim();
@@ -732,17 +917,35 @@ var refresh = async function(){
     document.getElementById('ip').textContent = s.ip || '';
     const list = document.getElementById('saved');
     list.innerHTML = '';
-    (s.saved||[]).forEach((u,i)=>{
+    (s.saved||[]).forEach((entry,i)=>{
+      const uid  = entry.uid || '';
+      const name = entry.name || '';
       const li = document.createElement('li');
-      li.innerHTML = '<span class="kv">'+u+'</span>';
+      const left = document.createElement('span');
+      left.innerHTML = (name ? '<b>'+escHtml(name)+'</b> &middot; ' : '') +
+                       '<span class="kv">'+escHtml(uid)+'</span>';
       const right = document.createElement('span');
       const useBtn = document.createElement('button');
       useBtn.textContent = 'Load to writer';
-      useBtn.onclick = ()=>{ document.getElementById('uidIn').value = u; };
+      useBtn.onclick = ()=>{ document.getElementById('uidIn').value = uid; };
+      const renBtn = document.createElement('button');
+      renBtn.textContent = '\u270E';
+      renBtn.title = 'Rename';
+      renBtn.onclick = async ()=>{
+        const newName = prompt('Name for ' + uid + ' (blank to clear):', name);
+        if (newName === null) return;
+        const cleaned = newName.replace(/[\r\n"]/g, '').trim();
+        const r = await api('/api/cmd', {cmd:'rename', index:i, name:cleaned});
+        flash(r.message || 'Renamed', !r.ok);
+        refresh();
+      };
       const delBtn = document.createElement('button');
-      delBtn.textContent = '✕'; delBtn.className='danger';
+      delBtn.textContent = '\u2715'; delBtn.className='danger';
       delBtn.onclick = async ()=>{ await api('/api/cmd',{cmd:'forget',index:i}); refresh(); };
-      right.appendChild(useBtn); right.appendChild(delBtn);
+      right.appendChild(useBtn);
+      right.appendChild(renBtn);
+      right.appendChild(delBtn);
+      li.appendChild(left);
       li.appendChild(right);
       list.appendChild(li);
     });
@@ -804,7 +1007,15 @@ void handleStatus() {
   json += ",\"staIP\":\"" + (netMode == NET_STATION ? WiFi.localIP().toString() : String("")) + "\"";
   json += ",\"savedWifi\":" + savedWifi;
   json += ",\"savedWifiMax\":" + String((int)MAX_WIFI_CREDS);
-  json += ",\"saved\":" + loadSaved();
+  String savedJ = "[";
+  for (uint8_t i = 0; i < savedCacheN; i++) {
+    if (i) savedJ += ',';
+    savedJ += "{\"uid\":\"" + escJson(savedCache[i].uid) + "\"";
+    savedJ += ",\"name\":\"" + escJson(savedCache[i].name) + "\"}";
+  }
+  savedJ += "]";
+  json += ",\"saved\":" + savedJ;
+  json += ",\"savedMax\":" + String((int)MAX_SAVED_UIDS);
   json += "}";
   sendJson(200, json);
 }
@@ -858,42 +1069,33 @@ void handleCmd() {
       Serial.println(F("[CMD] save: no UID read yet"));
       sendJson(200, "{\"ok\":false,\"message\":\"No UID read yet.\"}"); return;
     }
-    String saved = loadSaved();
-    if (saved.indexOf("\"" + op.lastUidHex + "\"") >= 0) {
-      Serial.printf("[CMD] save: UID %s already in library\n", op.lastUidHex.c_str());
-      sendJson(200, "{\"ok\":false,\"message\":\"Already saved.\"}"); return;
+    String name = field("name");
+    int r = addSavedUid(op.lastUidHex, name);
+    if (r == 0) { sendJson(200, "{\"ok\":false,\"message\":\"Already saved.\"}"); return; }
+    if (r < 0) {
+      String msg = "Saved-UID limit reached (" + String((int)MAX_SAVED_UIDS) + ").";
+      sendJson(200, "{\"ok\":false,\"message\":\"" + escJson(msg) + "\"}"); return;
     }
-    if (saved == "[]") saved = "[\"" + op.lastUidHex + "\"]";
-    else { saved.remove(saved.length() - 1); saved += ",\"" + op.lastUidHex + "\"]"; }
-    writeSaved(saved);
-    Serial.printf("[CMD] save: UID %s added to library\n", op.lastUidHex.c_str());
     sendJson(200, "{\"ok\":true,\"message\":\"Saved.\"}");
     return;
   }
   if (cmd == "forget") {
     int idx = field("index").toInt();
     Serial.printf("[CMD] forget index=%d\n", idx);
-    String saved = loadSaved();
-    int count = 0, start = -1, end = -1, depth = 0;
-    for (size_t i = 0; i < saved.length(); i++) {
-      if (saved[i] == '"') {
-        if (depth == 0) { if (count == idx) start = i; depth = 1; }
-        else { depth = 0; if (count == idx) { end = i; break; } count++; }
-      }
-    }
-    if (start >= 0 && end > start) {
-      String removed = saved.substring(start + 1, end);
-      String before = saved.substring(0, start);
-      String after  = saved.substring(end + 1);
-      // strip the comma separator on whichever side
-      if (before.endsWith(",")) before.remove(before.length() - 1);
-      else if (after.startsWith(",")) after.remove(0, 1);
-      writeSaved(before + after);
-      Serial.printf("[CMD] forget: removed UID %s\n", removed.c_str());
-    } else {
-      Serial.printf("[CMD] forget: index %d not found\n", idx);
+    if (idx < 0 || !removeSavedAt((uint8_t)idx)) {
+      sendJson(200, "{\"ok\":false,\"message\":\"Index out of range.\"}"); return;
     }
     sendJson(200, "{\"ok\":true,\"message\":\"Removed.\"}");
+    return;
+  }
+  if (cmd == "rename") {
+    int idx = field("index").toInt();
+    String name = field("name");
+    Serial.printf("[CMD] rename index=%d name='%s'\n", idx, name.c_str());
+    if (idx < 0 || !renameSavedAt((uint8_t)idx, name)) {
+      sendJson(200, "{\"ok\":false,\"message\":\"Index out of range.\"}"); return;
+    }
+    sendJson(200, "{\"ok\":true,\"message\":\"Renamed.\"}");
     return;
   }
   if (cmd == "clone-start") {
@@ -1177,6 +1379,9 @@ void setup() {
   Serial.println();
   Serial.println(F("[WemosRFID] booting"));
 
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); // off; pattern starts after netMode is decided
+
   SPI.begin();
   mfrc.PCD_Init();
   delay(20);
@@ -1188,11 +1393,15 @@ void setup() {
     LittleFS.begin();
   }
   syncWifiCache();
+  migrateSavedJsonIfPresent();
+  syncSavedCache();
 
   WiFi.persistent(false);
 
+  setLedMode(LED_CONNECTING);
   if (tryConnectAny()) {
     netMode = NET_STATION;
+    setLedMode(LED_STATION);
     Serial.printf("[STA] joined '%s' IP=%s\n",
                   staSSID.c_str(), WiFi.localIP().toString().c_str());
   } else {
@@ -1203,6 +1412,7 @@ void setup() {
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS);
     netMode = NET_SETUP_AP;
+    setLedMode(LED_AP);
     Serial.printf("[AP] SSID=%s IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
   }
 
@@ -1228,4 +1438,5 @@ void loop() {
   server.handleClient();
   MDNS.update();
   processCard();
+  updateLed();
 }

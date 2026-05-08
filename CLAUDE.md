@@ -4,7 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Single-file Arduino sketch (`WemosRFID.ino`) for a **WeMos D1 Mini (ESP8266)** + **MFRC522 (RC522)** RFID reader. The board runs as a Wi-Fi access point and serves a self-contained web UI for reading/cloning/writing 13.56 MHz cards. There is no separate frontend build, no SD card, no filesystem upload — the UI is a PROGMEM string literal compiled into the firmware.
+Single-file Arduino sketch (`WemosRFID.ino`) for a **WeMos D1 Mini (ESP8266)** + **MFRC522 (RC522)** RFID reader. The board serves a self-contained web UI for reading/cloning/writing 13.56 MHz cards. There is no separate frontend build, no SD card, no filesystem upload — the UI is a PROGMEM string literal compiled into the firmware.
+
+The device runs in one of two network modes (`NetMode` enum):
+- `NET_SETUP_AP` — first boot, no creds, or saved creds failed. Hosts the `WemosRFID` hotspot in `WIFI_AP_STA` (STA leg kept alive only so `WiFi.scanNetworks()` works during provisioning).
+- `NET_STATION` — joined the saved external Wi-Fi from `/wifi.txt` (line 1 SSID, line 2 password). On STA failure within `STA_CONNECT_TIMEOUT_MS` (15 s), `setup()` falls back to `NET_SETUP_AP`.
+
+Both modes serve the same `INDEX_HTML`; the JS shows/hides the **Network** card sections based on `s.netMode` from `/api/status`. mDNS (`wemosrfid.local`) and NetBIOS (`\\WEMOSRFID`) are advertised in both modes.
 
 ## Build & flash
 
@@ -23,11 +29,20 @@ The whole sketch is one `.ino` file built around an explicit state machine and a
 
 This means a "command" is a two-step interaction: the POST queues intent, the next card tap executes it. Anything that needs to talk to the reader must go through the `OpMode` enum and `processCard()` switch — don't add SPI calls inside HTTP handlers.
 
+**Wi-Fi handlers are the exception** — they bypass the OpState machine because they don't touch the RC522:
+- `handleWifiScan` (`GET /api/wifi-scan`) calls `WiFi.scanNetworks()` synchronously (blocks 2–3 s).
+- `handleWifiSave` (`POST /api/wifi-save`) accepts a regular form-encoded post (`server.arg("ssid"/"pass")`) — chosen so setup works even with broken JS — writes `/wifi.txt`, then `ESP.restart()`.
+- The `wifi-forget` command in `handleCmd` clears `/wifi.txt` and restarts.
+
 **Embedded UI.** The single-page app lives in `INDEX_HTML[] PROGMEM` inside the `.ino`. Editing HTML/CSS/JS = editing C++. The UI is served by `handleRoot()` via `server.send_P`, and only `/`, `/api/status`, `/api/cmd` are routed.
 
 **Hand-rolled JSON.** There is no ArduinoJson dependency. Request parsing uses a `field` lambda inside `handleCmd()` that does naive `indexOf` substring extraction — it assumes flat objects with simple string/number values and will break on nested objects, escaped quotes, or whitespace variations. Responses are built by `String` concatenation; `escJson()` only handles `" \ \n \r \t`. Keep new fields flat and ASCII.
 
 **Persistent saved UIDs.** `loadSaved()` / `writeSaved()` round-trip the entire `/saved.json` file as a raw JSON array string. `forget` mutates by character-index splicing rather than parsing — the array is treated as text. Don't introduce a real JSON parser without rewriting these together.
+
+**LittleFS layout:**
+- `/saved.json` — JSON array of UID strings (manipulated as raw text, see above).
+- `/wifi.txt` — two-line plain text: SSID, then password. Avoids JSON parsing for credentials and tolerates `"`/`\` in passwords. Created by `saveWifiCreds`, deleted by `clearWifiCreds`.
 
 ## Hardware-tied constants
 
@@ -37,7 +52,9 @@ This means a "command" is a two-step interaction: the POST queues intent, the ne
 
 ## Known quirks
 
-- **AP password mismatch.** [README.md:98](README.md) says `rfidtools`; [WemosRFID.ino:36](WemosRFID.ino:36) sets `AP_PASS = "rfidwemos"`. The firmware wins. If you change one, change the other.
+- **AP password is `rfidwemos`** (not `rfidtools` as some older docs claim). Set in [WemosRFID.ino](WemosRFID.ino) as `AP_PASS`.
+- **STA scan requires AP_STA mode.** The setup hotspot uses `WIFI_AP_STA` rather than pure `WIFI_AP` so `WiFi.scanNetworks()` works during provisioning. Don't switch it back to `WIFI_AP` without moving the scan elsewhere.
+- **Bricking yourself out** — entering wrong creds is recoverable (15 s STA timeout → falls back to setup AP), but a *valid SSID with a wrong password* can sometimes cause `WL_CONNECT_FAILED` quickly enough that you don't get locked out. The "Forget Wi-Fi" button (`wifi-forget` cmd) is the in-band escape hatch; if the device is unreachable, reflash `/wifi.txt` via Arduino IDE's LittleFS uploader or wipe the FS and reformat.
 - **UID write only works on "magic" Gen1A** MIFARE Classic cards. `MFRC522::MIFARE_SetUid` will fail silently-ish on genuine cards — surfaced as `"Write failed. Card likely not a magic Gen1A card."`. Also, `MODE_WRITE_UID` / `MODE_CLONE_WRITE_DST` reject 7-byte UIDs (`pendingUidLen != 4`) even though `write-uid` validation accepts 4 or 7 — the magic-card protocol used here is 4-byte only.
 - **Dump uses default key A `FF FF FF FF FF FF`** for every sector. Sectors with custom keys print `auth failed` and are skipped. Custom-key support is not implemented.
 - **Block-write guardrails** in `handleCmd()` reject blocks `<1`, `>62`, or `% 4 == 3` (sector trailers). Block 0 is also blocked because writing it on non-magic cards bricks auth.

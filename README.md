@@ -1,10 +1,15 @@
 # WemosRFID
 
 A web-based RFID toolkit for the **WeMos D1 Mini (ESP-12F / ESP8266)** paired
-with an **MFRC522 (RC522) 13.56 MHz** reader/writer module. The ESP8266 hosts
-its own Wi-Fi access point and serves a single-page web UI from flash —
-connect with any phone or laptop and operate the RFID module from your
-browser. No app, no cloud, no internet connection required.
+with an **MFRC522 (RC522) 13.56 MHz** reader/writer module. Serves a single-page
+web UI from flash — connect with any phone or laptop and operate the RFID
+module from your browser. No app, no cloud, no internet connection required.
+
+The device can either host its own Wi-Fi hotspot **or** join your existing
+network — pick whichever is more convenient. On first boot it comes up as a
+hotspot for setup; once you save Wi-Fi credentials it joins that network on
+every subsequent boot, and you can reach it by name (`wemosrfid.local` /
+`\\WEMOSRFID`) without needing to know its IP.
 
 ## Features
 
@@ -17,7 +22,9 @@ browser. No app, no cloud, no internet connection required.
 | Write data block              | Any non-trailer block, default keys                             |
 | Saved-UID library             | Persisted in LittleFS, browse / load / delete from the UI       |
 | Captive web UI                | Embedded HTML/CSS/JS in PROGMEM, no SD card or filesystem upload required |
-| mDNS                          | Reachable as `http://wemosrfid.local`                           |
+| Wi-Fi setup portal            | Pick an SSID from a scan and save creds — no reflash needed     |
+| Auto-join saved Wi-Fi         | Joins your network on boot; falls back to setup AP if it fails  |
+| mDNS + NetBIOS                | Reachable as `http://wemosrfid.local` or `\\WEMOSRFID`          |
 
 > **Note:** UID writing only works on so-called **"magic" Gen1A** MIFARE
 > Classic cards (UID-changeable). Genuine MIFARE cards have a permanent UID
@@ -93,12 +100,34 @@ browser. No app, no cloud, no internet connection required.
 
 ## Using it
 
-1. Power the WeMos. From a phone or laptop, join the Wi-Fi network:
+### First-time setup (Wi-Fi provisioning)
+
+1. Power the WeMos. From a phone or laptop, join the device's hotspot:
    - **SSID:** `WemosRFID`
-   - **Password:** `rfidtools`
-2. Open `http://192.168.4.1` (or `http://wemosrfid.local` on most platforms).
-3. Tap a card on the RC522 — its UID and type appear at the top.
-4. Use the panels to:
+   - **Password:** `rfidwemos`
+2. Open `http://192.168.4.1` (or `http://wemosrfid.local`).
+3. In the **Network** card, click **Scan** to populate nearby SSIDs (or type
+   one), enter the password, and click **Save & connect**.
+4. The device reboots and joins your Wi-Fi. The `WemosRFID` hotspot disappears.
+
+### After setup
+
+Reach the device on your normal network at one of:
+
+- `http://wemosrfid.local` — macOS, iOS, Linux, Windows 10+
+- `\\WEMOSRFID` — Windows file explorer (NetBIOS, for older Windows)
+- The IP address shown in the **Network** card (also printed to the serial
+  monitor at 115200 baud on every connect, and visible in your router's DHCP
+  leases)
+
+Want a stable IP? Set a DHCP reservation in your router using the device's
+MAC. Want to switch networks? In the UI, **Network → Forget Wi-Fi**: the
+device wipes its saved creds and reboots back into the setup hotspot.
+
+### Day-to-day
+
+1. Tap a card on the RC522 — its UID and type appear at the top.
+2. Use the panels to:
    - **Read** the current UID or dump full memory
    - **Clone** a card: press *Start Clone* → tap source → tap magic target
    - **Write UID**: enter `DE AD BE EF` style hex → press the button → tap a
@@ -112,21 +141,38 @@ Press *Cancel* to abort a pending operation.
 
 ## API (for scripting)
 
-The web UI talks to two simple endpoints:
-
-- `GET  /api/status` — JSON with presence, last UID, card type, status
-  message, AP IP, saved-UID array.
-- `POST /api/cmd`    — JSON body, `{ "cmd": "<name>", ... }`. Commands:
+- `GET  /api/status`    — JSON with presence, last UID, card type, status
+  message, IP, `netMode` (`setup` / `station`), `staSSID`, `staIP`, and the
+  saved-UID array.
+- `POST /api/cmd`       — JSON body `{ "cmd": "<name>", ... }`. Commands:
   `read`, `dump`, `save`, `forget` (`index`), `clone-start`, `cancel`,
-  `write-uid` (`uid`), `write-block` (`block`, `data`).
+  `write-uid` (`uid`), `write-block` (`block`, `data`), `wifi-forget`
+  (clears Wi-Fi creds and reboots).
+- `GET  /api/wifi-scan`  — JSON array of nearby networks, sorted by RSSI:
+  `[{ "ssid": "...", "rssi": -54, "enc": true }, ...]`.
+- `GET  /api/wifi-saved` — JSON array of saved credentials. Empty `[]` when
+  none are persisted; otherwise `[{ "ssid": "...", "pass": "..." }]`. The
+  password is returned in plaintext — anyone who can reach the device's HTTP
+  endpoint can read it. Single-element today; shaped as an array for future
+  multi-network support.
+- `POST /api/wifi-save`  — **form-encoded** (not JSON): `ssid=...&pass=...`.
+  Saves credentials and reboots into station mode.
 
-Example:
+Examples:
 
 ```bash
-curl -s http://192.168.4.1/api/status
-curl -s -X POST http://192.168.4.1/api/cmd \
+# Status (replace host with wemosrfid.local once on the LAN, or 192.168.4.1 in setup mode)
+curl -s http://wemosrfid.local/api/status
+
+# Queue a UID write
+curl -s -X POST http://wemosrfid.local/api/cmd \
   -H 'Content-Type: application/json' \
   -d '{"cmd":"write-uid","uid":"DEADBEEF"}'
+
+# Save Wi-Fi credentials (form-encoded)
+curl -s -X POST http://192.168.4.1/api/wifi-save \
+  --data-urlencode 'ssid=MyHomeWifi' \
+  --data-urlencode 'pass=hunter2'
 ```
 
 ## Configuration
@@ -134,12 +180,17 @@ curl -s -X POST http://192.168.4.1/api/cmd \
 Edit the constants near the top of `WemosRFID.ino`:
 
 ```cpp
-constexpr uint8_t RST_PIN = 0;            // D3
-constexpr uint8_t SS_PIN  = 15;           // D8
-const char* AP_SSID       = "WemosRFID";
-const char* AP_PASS       = "rfidtools";  // 8+ chars, WPA2
-const char* MDNS_HOST     = "wemosrfid";
+constexpr uint8_t  RST_PIN   = 0;           // D3
+constexpr uint8_t  SS_PIN    = 15;          // D8
+const char*  AP_SSID         = "WemosRFID"; // setup-hotspot SSID
+const char*  AP_PASS         = "rfidwemos"; // 8+ chars, WPA2
+const char*  MDNS_HOST       = "wemosrfid"; // mDNS + NetBIOS name
+constexpr uint32_t STA_CONNECT_TIMEOUT_MS = 15000; // STA join timeout before fallback
 ```
+
+Saved Wi-Fi credentials live on LittleFS at `/wifi.txt` (line 1 SSID, line 2
+password). Delete the file (or click **Forget Wi-Fi** in the UI) to force the
+device back into setup mode.
 
 ## Troubleshooting
 
@@ -151,8 +202,15 @@ const char* MDNS_HOST     = "wemosrfid";
   has a hardcoded UID. Buy "MIFARE 1K UID changeable" / "Magic Gen1A" cards.
 - **Dump prints `auth failed`** — the sector isn't using the default key
   `FF FF FF FF FF FF`. Custom-key support isn't built in yet.
-- **Can't reach `wemosrfid.local`** — Android doesn't resolve mDNS by
-  default; use the IP `192.168.4.1` instead.
+- **Can't reach `wemosrfid.local` from Android** — Android doesn't resolve
+  mDNS by default. In setup mode, use `192.168.4.1`. In station mode, use
+  the IP shown in your router's DHCP leases (or set a DHCP reservation so
+  it stays the same), or try `\\WEMOSRFID` on a nearby Windows machine.
+- **Saved Wi-Fi creds are wrong / network gone** — the device falls back to
+  the `WemosRFID` setup hotspot after ~15 s. Reconnect and re-provision.
+- **Locked out somehow** — reflash with the Arduino IDE; LittleFS survives
+  re-uploads of the sketch unless you also flash a new filesystem image.
+  To wipe everything, use *Tools → Erase Flash → All Flash Contents* once.
 
 ## Legal / ethical use
 

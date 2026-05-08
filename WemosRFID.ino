@@ -12,19 +12,32 @@
  *   3.3V      -> 3V3
  *   GND       -> GND
  *
- * Required libraries (Arduino IDE -> Library Manager):
+ * Required libraries (Arduino IDE -> Library Manager):/Users/matimacayal/Documents/Arduino/WemosRFID/WemosRFID.ino
  *   - "MFRC522" by GithubCommunity (miguelbalboa fork)
  *   - ESP8266WiFi, ESP8266WebServer, ESP8266mDNS, LittleFS (bundled w/ esp8266 core)
  *
  * Board: "LOLIN(WEMOS) D1 R2 & mini" in the ESP8266 boards manager.
  *
- * Usage: connect to Wi-Fi SSID "WemosRFID" (password "rfidtools"),
- * then browse to http://192.168.4.1 (or http://wemosrfid.local).
+ * First-boot / setup: the device hosts a Wi-Fi hotspot
+ *   SSID "WemosRFID", password "rfidwemos"
+ * Connect to it and open http://192.168.4.1 — the Network card lets you
+ * join your home Wi-Fi. Credentials are stored on LittleFS (/wifi.txt) and
+ * the device joins that network automatically on subsequent boots.
+ *
+ * Discovery on the joined network:
+ *   - http://wemosrfid.local       (mDNS — macOS, iOS, Linux, Windows 10+)
+ *   - \\WEMOSRFID                  (NetBIOS — older Windows / file explorer)
+ *   - router DHCP leases           (Android, fallback)
+ *   - Serial monitor at 115200     (always prints the IP on connect)
+ *
+ * If saved credentials fail (network gone, password changed), the device
+ * falls back to the WemosRFID hotspot after ~15 s so you can re-provision.
  */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
+#include <ESP8266NetBIOS.h>
 #include <LittleFS.h>
 #include <SPI.h>
 #include <MFRC522.h>
@@ -36,10 +49,19 @@ const char*  AP_SSID         = "WemosRFID";
 const char*  AP_PASS         = "rfidwemos"; // 8+ chars required by WPA2
 const char*  MDNS_HOST       = "wemosrfid";
 const char*  SAVED_FILE      = "/saved.json";
+const char*  WIFI_FILE       = "/wifi.txt";  // line 1: SSID, line 2: password
+constexpr uint32_t STA_CONNECT_TIMEOUT_MS = 15000;
 
 // ---- Globals ---------------------------------------------------------------
 MFRC522 mfrc(SS_PIN, RST_PIN);
 ESP8266WebServer server(80);
+
+enum NetMode : uint8_t {
+  NET_SETUP_AP = 0,   // no creds (or STA failed): hosting WemosRFID hotspot
+  NET_STATION         // joined a saved external Wi-Fi
+};
+NetMode netMode = NET_SETUP_AP;
+String  staSSID = "";
 
 enum OpMode : uint8_t {
   MODE_IDLE = 0,
@@ -145,6 +167,58 @@ void writeSaved(const String& json) {
   f.close();
 }
 
+// ---- Wi-Fi credentials store ----------------------------------------------
+bool loadWifiCreds(String& ssid, String& pass) {
+  if (!LittleFS.exists(WIFI_FILE)) return false;
+  File f = LittleFS.open(WIFI_FILE, "r");
+  if (!f) return false;
+  ssid = f.readStringUntil('\n'); ssid.trim();
+  pass = f.readStringUntil('\n'); pass.trim();
+  f.close();
+  return ssid.length() > 0;
+}
+
+void saveWifiCreds(const String& ssid, const String& pass) {
+  File f = LittleFS.open(WIFI_FILE, "w");
+  if (!f) return;
+  f.println(ssid);
+  f.println(pass);
+  f.close();
+}
+
+void clearWifiCreds() {
+  LittleFS.remove(WIFI_FILE);
+}
+
+bool tryConnectSTA(const String& ssid, const String& pass) {
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(MDNS_HOST);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  Serial.printf("[STA] connecting to '%s'", ssid.c_str());
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < STA_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
+String htmlEscape(const String& in) {
+  String o; o.reserve(in.length());
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '<': o += "&lt;";   break;
+      case '>': o += "&gt;";   break;
+      case '&': o += "&amp;";  break;
+      case '"': o += "&quot;"; break;
+      default:  o += c;
+    }
+  }
+  return o;
+}
+
 // ---- RFID operations -------------------------------------------------------
 String readCardSummary() {
   String uid = bytesToHex(mfrc.uid.uidByte, mfrc.uid.size);
@@ -223,7 +297,7 @@ button{background:#1f2630;color:var(--fg);border:1px solid #2c3340;border-radius
 button:hover{border-color:var(--acc)}
 button.primary{background:#163a52;border-color:#1f5d85}
 button.danger{background:#3a1d1d;border-color:#7a2c2c}
-input[type=text]{background:#0b0f14;color:var(--fg);border:1px solid #2c3340;border-radius:6px;padding:8px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:14px;flex:1;min-width:160px}
+input[type=text],input[type=password]{background:#0b0f14;color:var(--fg);border:1px solid #2c3340;border-radius:6px;padding:8px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:14px;flex:1;min-width:160px}
 .kv{font-family:ui-monospace,Menlo,Consolas,monospace}
 .muted{color:var(--mut);font-size:13px}
 pre{background:#0b0f14;border:1px solid #222;border-radius:6px;padding:10px;overflow:auto;max-height:280px;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace}
@@ -249,6 +323,33 @@ footer{padding:16px;color:var(--mut);text-align:center;font-size:12px}
     <h2>Current Card</h2>
     <div>UID: <span id="uid" class="uid">--</span><span id="ctype" class="tag"></span></div>
     <div class="muted" id="status">Ready.</div>
+  </div>
+
+  <div class="card" id="wifiCard">
+    <h2>Network</h2>
+    <div id="wifiSetup" style="display:none">
+      <div class="muted">Join your Wi-Fi so the device is reachable on your normal network. The <b>WemosRFID</b> hotspot will turn off after connecting.</div>
+      <form method="POST" action="/api/wifi-save" style="margin-top:8px">
+        <div class="row">
+          <input list="ssidList" name="ssid" placeholder="SSID" autocomplete="off" required style="flex:1"/>
+          <button type="button" onclick="scanWifi()">Scan</button>
+        </div>
+        <datalist id="ssidList"></datalist>
+        <div class="row" style="margin-top:6px">
+          <input id="passIn" name="pass" type="password" placeholder="password (blank for open networks)" style="flex:1"/>
+          <button type="button" id="passToggle" onclick="togglePassVis()" title="Show/hide password" aria-label="Show password">show</button>
+          <button class="primary" type="submit">Save &amp; connect</button>
+        </div>
+      </form>
+      <div class="warn" style="margin-top:8px">After saving, the device reboots. Find it at <code>http://wemosrfid.local</code> on the joined network (Windows, macOS, iOS, Linux). On Android, check your router's DHCP leases.</div>
+    </div>
+    <div id="wifiConnected" style="display:none">
+      <div>SSID: <span id="staSSID" class="kv"></span></div>
+      <div>IP:&nbsp;&nbsp; <span id="staIP" class="kv"></span></div>
+      <div class="row" style="margin-top:8px">
+        <button class="danger" onclick="forgetWifi()">Forget Wi-Fi (back to setup)</button>
+      </div>
+    </div>
   </div>
 
   <div class="card">
@@ -331,6 +432,36 @@ async function writeBlock(){
   const r = await api('/api/cmd', {cmd:'write-block', block:b, data:d});
   flash(r.message || 'queued', !r.ok);
 }
+function togglePassVis(){
+  const el  = document.getElementById('passIn');
+  const btn = document.getElementById('passToggle');
+  const showing = el.type === 'password';
+  el.type = showing ? 'text' : 'password';
+  btn.textContent = showing ? 'hide' : 'show';
+  btn.setAttribute('aria-label', showing ? 'Hide password' : 'Show password');
+}
+async function scanWifi(){
+  flash('Scanning…');
+  try {
+    const r = await fetch('/api/wifi-scan');
+    const list = await r.json();
+    const dl = document.getElementById('ssidList');
+    dl.innerHTML = '';
+    list.sort((a,b)=>b.rssi-a.rssi).forEach(n=>{
+      const o = document.createElement('option');
+      o.value = n.ssid;
+      o.textContent = n.ssid + ' (' + n.rssi + ' dBm' + (n.enc ? '' : ', open') + ')';
+      dl.appendChild(o);
+    });
+    flash('Found ' + list.length + ' networks');
+  } catch(e){ flash('Scan failed', true); }
+}
+async function forgetWifi(){
+  if(!confirm('Forget Wi-Fi credentials and reboot? You will need to reconnect to the WemosRFID hotspot.')) return;
+  await api('/api/cmd', {cmd:'wifi-forget'});
+  flash('Forgotten. Device is rebooting — reconnect to the WemosRFID hotspot.');
+}
+let _scannedOnce = false;
 async function refresh(){
   try{
     const s = await api('/api/status');
@@ -357,6 +488,18 @@ async function refresh(){
       list.appendChild(li);
     });
     document.getElementById('savedEmpty').style.display = (s.saved && s.saved.length) ? 'none' : 'block';
+    const setupEl = document.getElementById('wifiSetup');
+    const connEl  = document.getElementById('wifiConnected');
+    if (s.netMode === 'station') {
+      setupEl.style.display = 'none';
+      connEl.style.display  = 'block';
+      document.getElementById('staSSID').textContent = s.staSSID || '';
+      document.getElementById('staIP').textContent   = s.staIP || s.ip || '';
+    } else {
+      setupEl.style.display = 'block';
+      connEl.style.display  = 'none';
+      if (!_scannedOnce) { _scannedOnce = true; scanWifi(); }
+    }
   }catch(e){}
 }
 setInterval(refresh, 700); refresh();
@@ -383,18 +526,23 @@ String escJson(const String& in) {
 }
 
 void handleRoot() {
+  server.sendHeader("Connection", "close");
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
 void handleStatus() {
   bool present = (op.lastEventMs && (millis() - op.lastEventMs) < 1500);
+  String ip = (netMode == NET_STATION) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   String json = "{";
   json += "\"present\":" + String(present ? "true" : "false");
   json += ",\"uid\":\"" + op.lastUidHex + "\"";
   json += ",\"cardType\":\"" + escJson(op.lastCardType) + "\"";
   json += ",\"status\":\"" + escJson(op.lastResult) + "\"";
   json += ",\"mode\":" + String((int)op.mode);
-  json += ",\"ip\":\"" + WiFi.softAPIP().toString() + "\"";
+  json += ",\"ip\":\"" + ip + "\"";
+  json += ",\"netMode\":\"" + String(netMode == NET_STATION ? "station" : "setup") + "\"";
+  json += ",\"staSSID\":\"" + escJson(staSSID) + "\"";
+  json += ",\"staIP\":\"" + (netMode == NET_STATION ? WiFi.localIP().toString() : String("")) + "\"";
   json += ",\"saved\":" + loadSaved();
   json += "}";
   sendJson(200, json);
@@ -484,6 +632,14 @@ void handleCmd() {
     sendJson(200, "{\"ok\":true,\"message\":\"Cancelled.\"}");
     return;
   }
+  if (cmd == "wifi-forget") {
+    clearWifiCreds();
+    sendJson(200, "{\"ok\":true,\"message\":\"Wi-Fi forgotten. Rebooting.\"}");
+    Serial.println(F("[WiFi] credentials cleared, restarting"));
+    delay(400);
+    ESP.restart();
+    return;
+  }
   if (cmd == "write-uid") {
     String uid = field("uid");
     uint8_t buf[10]; uint8_t len = 0;
@@ -520,6 +676,71 @@ void handleCmd() {
 
 void handleNotFound() {
   server.send(404, "text/plain", "Not found");
+}
+
+void handleWifiSaved() {
+  // Returns a JSON array — single element today (we only persist one set of
+  // creds), but shaped for future multi-network support. Includes the password
+  // in plaintext, consistent with the rest of the unauthenticated API.
+  String ssid, pass;
+  String json = "[";
+  if (loadWifiCreds(ssid, pass)) {
+    json += "{\"ssid\":\"" + escJson(ssid) + "\",";
+    json += "\"pass\":\"" + escJson(pass) + "\"}";
+  }
+  json += "]";
+  sendJson(200, json);
+}
+
+void handleWifiScan() {
+  // ESP8266 needs the STA radio active for scanNetworks(). In NET_SETUP_AP we
+  // already brought the chip up in WIFI_AP_STA so this just works; in station
+  // mode we're already STA.
+  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
+  String json = "[";
+  for (int i = 0; i < n; i++) {
+    if (i) json += ',';
+    json += "{\"ssid\":\"" + escJson(WiFi.SSID(i)) + "\"";
+    json += ",\"rssi\":" + String(WiFi.RSSI(i));
+    json += ",\"enc\":" + String(WiFi.encryptionType(i) != ENC_TYPE_NONE ? "true" : "false");
+    json += "}";
+  }
+  json += "]";
+  WiFi.scanDelete();
+  sendJson(200, json);
+}
+
+void handleWifiSave() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  ssid.trim();
+  if (ssid.length() == 0) {
+    server.send(400, "text/plain", "SSID required");
+    return;
+  }
+  saveWifiCreds(ssid, pass);
+  Serial.printf("[WiFi] saved creds for '%s', restarting\n", ssid.c_str());
+  String safeSsid = htmlEscape(ssid);
+  String body =
+    "<!doctype html><html><head><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>WemosRFID — Wi-Fi saved</title>"
+    "<style>body{margin:0;background:#0e1116;color:#e6e6e6;font:15px/1.5 -apple-system,system-ui,sans-serif;padding:24px;max-width:560px}"
+    "h1{color:#5cc8ff;font-size:20px}code{background:#0b0f14;padding:2px 6px;border-radius:4px}</style>"
+    "</head><body>"
+    "<h1>Wi-Fi saved</h1>"
+    "<p>The device is rebooting and will join <b>" + safeSsid + "</b>. The "
+    "<i>WemosRFID</i> hotspot will disappear in a few seconds — your phone may "
+    "switch back to its previous network automatically.</p>"
+    "<p>Once joined, find the device at <code>http://wemosrfid.local</code> "
+    "(macOS, iOS, Linux, Windows 10+) or <code>\\\\WEMOSRFID</code> from "
+    "Windows Explorer. On Android, look at your router's DHCP leases.</p>"
+    "<p>If the credentials are wrong, the device will fall back to the "
+    "<i>WemosRFID</i> hotspot after about 15 seconds — reconnect and try again.</p>"
+    "</body></html>";
+  server.send(200, "text/html", body);
+  delay(500);
+  ESP.restart();
 }
 
 // ---- Main loop card processing --------------------------------------------
@@ -606,19 +827,37 @@ void setup() {
   }
 
   WiFi.persistent(false);
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  Serial.print(F("[AP] SSID=")); Serial.print(AP_SSID);
-  Serial.print(F(" IP=")); Serial.println(WiFi.softAPIP());
+
+  String savedSsid, savedPass;
+  if (loadWifiCreds(savedSsid, savedPass) && tryConnectSTA(savedSsid, savedPass)) {
+    netMode = NET_STATION;
+    staSSID = savedSsid;
+    Serial.printf("[STA] joined '%s' IP=%s\n",
+                  savedSsid.c_str(), WiFi.localIP().toString().c_str());
+  } else {
+    if (savedSsid.length()) Serial.println(F("[STA] saved creds failed, falling back to setup AP"));
+    WiFi.disconnect(false);
+    // AP_STA (not pure AP) so handleWifiScan() can use the STA radio while we
+    // host the setup hotspot.
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    netMode = NET_SETUP_AP;
+    Serial.printf("[AP] SSID=%s IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  }
 
   if (MDNS.begin(MDNS_HOST)) {
     MDNS.addService("http", "tcp", 80);
     Serial.printf("[mDNS] http://%s.local\n", MDNS_HOST);
   }
+  NBNS.begin(MDNS_HOST);
+  Serial.printf("[NetBIOS] \\\\%s\n", MDNS_HOST);
 
   server.on("/", handleRoot);
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/cmd", HTTP_POST, handleCmd);
+  server.on("/api/status",    HTTP_GET,  handleStatus);
+  server.on("/api/cmd",       HTTP_POST, handleCmd);
+  server.on("/api/wifi-scan",  HTTP_GET,  handleWifiScan);
+  server.on("/api/wifi-saved", HTTP_GET,  handleWifiSaved);
+  server.on("/api/wifi-save",  HTTP_POST, handleWifiSave);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println(F("[HTTP] server up on :80"));

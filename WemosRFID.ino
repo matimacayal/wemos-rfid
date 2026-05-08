@@ -49,8 +49,9 @@ const char*  AP_SSID         = "WemosRFID";
 const char*  AP_PASS         = "rfidwemos"; // 8+ chars required by WPA2
 const char*  MDNS_HOST       = "wemosrfid";
 const char*  SAVED_FILE      = "/saved.json";
-const char*  WIFI_FILE       = "/wifi.txt";  // line 1: SSID, line 2: password
-constexpr uint32_t STA_CONNECT_TIMEOUT_MS = 15000;
+const char*  WIFI_FILE       = "/wifi.txt";  // paired lines: ssid1, pass1, ssid2, pass2, ...
+constexpr uint32_t STA_CONNECT_TIMEOUT_MS = 15000;  // per-network connect timeout
+constexpr uint8_t  MAX_WIFI_CREDS = 4;              // max saved networks
 
 // ---- Globals ---------------------------------------------------------------
 MFRC522 mfrc(SS_PIN, RST_PIN);
@@ -84,6 +85,13 @@ struct OpState {
   String   lastDump       = "";
   uint32_t lastEventMs    = 0;
 } op;
+
+struct WifiCred {
+  String ssid;
+  String pass;
+};
+WifiCred wifiCache[MAX_WIFI_CREDS];
+uint8_t  wifiCacheN = 0;
 
 // ---- Helpers ---------------------------------------------------------------
 String bytesToHex(const uint8_t* buf, uint8_t len, bool spaced = false) {
@@ -168,9 +176,14 @@ void writeSaved(const String& json) {
 }
 
 // ---- Wi-Fi credentials store ----------------------------------------------
-bool loadWifiCreds(String& ssid, String& pass) {
+// Load all saved creds. Returns count via outN. File format is paired lines:
+// ssid1\npass1\nssid2\npass2\n... — paired-line is intentional; avoids JSON
+// parsing for credentials and tolerates "/\ in passwords (per existing
+// design rationale for the single-cred case).
+bool loadAllWifiCreds(WifiCred* out, uint8_t maxN, uint8_t& outN) {
+  outN = 0;
   if (!LittleFS.exists(WIFI_FILE)) {
-    Serial.println(F("[WiFi] no saved creds"));
+    Serial.println(F("[WiFi] no saved creds file"));
     return false;
   }
   File f = LittleFS.open(WIFI_FILE, "r");
@@ -178,34 +191,96 @@ bool loadWifiCreds(String& ssid, String& pass) {
     Serial.println(F("[WiFi] failed to open creds file"));
     return false;
   }
-  ssid = f.readStringUntil('\n'); ssid.trim();
-  pass = f.readStringUntil('\n'); pass.trim();
-  f.close();
-  if (ssid.length() == 0) {
-    Serial.println(F("[WiFi] creds file empty"));
-    return false;
+  while (f.available() && outN < maxN) {
+    String s = f.readStringUntil('\n'); s.trim();
+    String p = f.readStringUntil('\n'); p.trim();
+    if (s.length() == 0) continue;
+    out[outN].ssid = s;
+    out[outN].pass = p;
+    outN++;
   }
-  Serial.printf("[WiFi] loaded creds for SSID '%s' (pass len=%u)\n",
-                ssid.c_str(), (unsigned)pass.length());
-  return true;
+  f.close();
+  Serial.printf("[WiFi] loaded %u saved network(s)\n", outN);
+  for (uint8_t i = 0; i < outN; i++) {
+    Serial.printf("[WiFi]   %u) '%s' (pass len=%u)\n",
+                  i, out[i].ssid.c_str(), (unsigned)out[i].pass.length());
+  }
+  return outN > 0;
 }
 
-void saveWifiCreds(const String& ssid, const String& pass) {
+void saveAllWifiCreds(const WifiCred* arr, uint8_t n) {
+  if (n == 0) {
+    LittleFS.remove(WIFI_FILE);
+    Serial.println(F("[WiFi] saved-creds file removed (empty list)"));
+    return;
+  }
   File f = LittleFS.open(WIFI_FILE, "w");
   if (!f) {
     Serial.println(F("[WiFi] failed to open creds file for write"));
     return;
   }
-  f.println(ssid);
-  f.println(pass);
+  for (uint8_t i = 0; i < n; i++) {
+    f.println(arr[i].ssid);
+    f.println(arr[i].pass);
+  }
   f.close();
-  Serial.printf("[WiFi] credentials saved for '%s' (pass len=%u)\n",
-                ssid.c_str(), (unsigned)pass.length());
+  Serial.printf("[WiFi] wrote %u saved network(s)\n", n);
+}
+
+// Add a new cred or update an existing one (matched by SSID).
+// Returns:  1 = added new,  0 = updated existing,  -1 = list full.
+int upsertWifiCred(const String& ssid, const String& pass) {
+  WifiCred all[MAX_WIFI_CREDS]; uint8_t n = 0;
+  loadAllWifiCreds(all, MAX_WIFI_CREDS, n);
+  for (uint8_t i = 0; i < n; i++) {
+    if (all[i].ssid == ssid) {
+      all[i].pass = pass;
+      saveAllWifiCreds(all, n);
+      syncWifiCache();
+      Serial.printf("[WiFi] updated cred for '%s'\n", ssid.c_str());
+      return 0;
+    }
+  }
+  if (n >= MAX_WIFI_CREDS) {
+    Serial.printf("[WiFi] cannot add '%s': list full (%u/%u)\n",
+                  ssid.c_str(), n, MAX_WIFI_CREDS);
+    return -1;
+  }
+  all[n].ssid = ssid;
+  all[n].pass = pass;
+  n++;
+  saveAllWifiCreds(all, n);
+  syncWifiCache();
+  Serial.printf("[WiFi] added cred for '%s' (now %u/%u)\n",
+                ssid.c_str(), n, MAX_WIFI_CREDS);
+  return 1;
+}
+
+bool removeWifiCredAt(uint8_t idx) {
+  WifiCred all[MAX_WIFI_CREDS]; uint8_t n = 0;
+  loadAllWifiCreds(all, MAX_WIFI_CREDS, n);
+  if (idx >= n) {
+    Serial.printf("[WiFi] remove index %u out of range (%u saved)\n", idx, n);
+    return false;
+  }
+  String removed = all[idx].ssid;
+  for (uint8_t i = idx; i + 1 < n; i++) all[i] = all[i + 1];
+  n--;
+  saveAllWifiCreds(all, n);
+  syncWifiCache();
+  Serial.printf("[WiFi] removed '%s' (now %u/%u)\n",
+                removed.c_str(), n, MAX_WIFI_CREDS);
+  return true;
 }
 
 void clearWifiCreds() {
   LittleFS.remove(WIFI_FILE);
-  Serial.println(F("[WiFi] credentials cleared"));
+  wifiCacheN = 0;
+  Serial.println(F("[WiFi] all credentials cleared"));
+}
+
+void syncWifiCache() {
+  loadAllWifiCreds(wifiCache, MAX_WIFI_CREDS, wifiCacheN);
 }
 
 bool tryConnectSTA(const String& ssid, const String& pass) {
@@ -231,6 +306,75 @@ bool tryConnectSTA(const String& ssid, const String& pass) {
   }
   Serial.printf("[STA] connect failed after %lu ms (status=%d)\n",
                 millis() - start, WiFi.status());
+  return false;
+}
+
+// Scan-first orchestrator: load all saved creds, scan for visible networks,
+// keep only the saved networks that are in range, sort by RSSI desc, and try
+// each until one connects. Skips networks that didn't show up in the scan,
+// so worst-case boot time is bounded by (visible-saved-count × per-net timeout).
+bool tryConnectAny() {
+  WifiCred saved[MAX_WIFI_CREDS]; uint8_t nSaved = 0;
+  loadAllWifiCreds(saved, MAX_WIFI_CREDS, nSaved);
+  if (nSaved == 0) return false;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(MDNS_HOST);
+  Serial.printf("[STA] scanning for %u saved network(s)...\n", nSaved);
+  uint32_t t0 = millis();
+  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
+  Serial.printf("[STA] scan: %d networks visible in %lu ms\n", n, millis() - t0);
+
+  struct Cand { uint8_t savedIdx; int32_t rssi; };
+  Cand cands[MAX_WIFI_CREDS];
+  uint8_t nCands = 0;
+  for (uint8_t s = 0; s < nSaved; s++) {
+    int32_t bestRssi = -1000;
+    bool found = false;
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == saved[s].ssid) {
+        if (WiFi.RSSI(i) > bestRssi) bestRssi = WiFi.RSSI(i);
+        found = true;
+      }
+    }
+    if (found) {
+      Serial.printf("[STA] candidate '%s' (%d dBm)\n",
+                    saved[s].ssid.c_str(), (int)bestRssi);
+      cands[nCands].savedIdx = s;
+      cands[nCands].rssi     = bestRssi;
+      nCands++;
+    } else {
+      Serial.printf("[STA] '%s' not in range, skipping\n", saved[s].ssid.c_str());
+    }
+  }
+  WiFi.scanDelete();
+
+  if (nCands == 0) {
+    Serial.println(F("[STA] no saved networks in range"));
+    return false;
+  }
+
+  // Sort candidates by RSSI descending (insertion sort, n <= MAX_WIFI_CREDS).
+  for (uint8_t i = 1; i < nCands; i++) {
+    Cand key = cands[i];
+    int j = (int)i - 1;
+    while (j >= 0 && cands[j].rssi < key.rssi) { cands[j + 1] = cands[j]; j--; }
+    cands[j + 1] = key;
+  }
+
+  for (uint8_t i = 0; i < nCands; i++) {
+    const WifiCred& c = saved[cands[i].savedIdx];
+    Serial.printf("[STA] attempt %u/%u: '%s' (%d dBm)\n",
+                  (unsigned)(i + 1), (unsigned)nCands,
+                  c.ssid.c_str(), (int)cands[i].rssi);
+    if (tryConnectSTA(c.ssid, c.pass)) {
+      staSSID = c.ssid;
+      return true;
+    }
+    WiFi.disconnect(false);
+    delay(100);
+  }
+  Serial.println(F("[STA] all in-range candidates failed"));
   return false;
 }
 
@@ -365,6 +509,7 @@ ul.saved li:last-child{border:0}
 .flash{padding:8px 12px;border-radius:6px;background:#173a2a;border:1px solid #245d3f;color:#cdebd5}
 .flash.err{background:#3a1d1d;border-color:#7a2c2c;color:#f3c8c8}
 .warn{background:#3a2f12;border:1px solid #75590f;border-radius:6px;padding:8px 10px;color:#e9d8a3;font-size:13px}
+.spacing{padding:8px 12px;border-radius:6px;background:#173a2a;border:1px solid #245d3f;color:#cdebd5}
 footer{padding:16px;color:var(--mut);text-align:center;font-size:12px}
 </style>
 </head>
@@ -381,32 +526,7 @@ footer{padding:16px;color:var(--mut);text-align:center;font-size:12px}
     <div class="muted" id="status">Ready.</div>
   </div>
 
-  <div class="card" id="wifiCard">
-    <h2>Network</h2>
-    <div id="wifiSetup" style="display:none">
-      <div class="muted">Join your Wi-Fi so the device is reachable on your normal network. The <b>WemosRFID</b> hotspot will turn off after connecting.</div>
-      <form method="POST" action="/api/wifi-save" style="margin-top:8px">
-        <div class="row">
-          <input list="ssidList" name="ssid" placeholder="SSID" autocomplete="off" required style="flex:1"/>
-          <button type="button" onclick="scanWifi()">Scan</button>
-        </div>
-        <datalist id="ssidList"></datalist>
-        <div class="row" style="margin-top:6px">
-          <input id="passIn" name="pass" type="password" placeholder="password (blank for open networks)" style="flex:1"/>
-          <button type="button" id="passToggle" onclick="togglePassVis()" title="Show/hide password" aria-label="Show password">show</button>
-          <button class="primary" type="submit">Save &amp; connect</button>
-        </div>
-      </form>
-      <div class="warn" style="margin-top:8px">After saving, the device reboots. Find it at <code>http://wemosrfid.local</code> on the joined network (Windows, macOS, iOS, Linux). On Android, check your router's DHCP leases.</div>
-    </div>
-    <div id="wifiConnected" style="display:none">
-      <div>SSID: <span id="staSSID" class="kv"></span></div>
-      <div>IP:&nbsp;&nbsp; <span id="staIP" class="kv"></span></div>
-      <div class="row" style="margin-top:8px">
-        <button class="danger" onclick="forgetWifi()">Forget Wi-Fi (back to setup)</button>
-      </div>
-    </div>
-  </div>
+  <div id="flash"></div>
 
   <div class="card">
     <h2>Read</h2>
@@ -453,7 +573,39 @@ footer{padding:16px;color:var(--mut);text-align:center;font-size:12px}
     <div class="muted" id="savedEmpty" style="display:none">No saved UIDs yet.</div>
   </div>
 
-  <div id="flash"></div>
+  <div id=spacing></div>
+
+  <div class="card" id="wifiCard">
+    <h2>Network</h2>
+    <div id="wifiBanner" class="muted"></div>
+
+    <div style="margin-top:10px">
+      <div class="muted">Saved networks (on boot: scan, then try in-range ones by signal strength):</div>
+      <ul id="wifiSavedList" class="saved"></ul>
+      <div class="muted" id="wifiSavedEmpty" style="display:none">No saved networks yet — add one below.</div>
+    </div>
+
+    <div id="wifiAdd" style="margin-top:12px">
+      <div class="muted" style="margin-bottom:6px">Add a network <span id="wifiCount" class="tag"></span></div>
+      <form method="POST" action="/api/wifi-save">
+        <div class="row">
+          <input list="ssidList" name="ssid" placeholder="SSID" autocomplete="off" required style="flex:1"/>
+          <button type="button" onclick="scanWifi()">Scan</button>
+        </div>
+        <datalist id="ssidList"></datalist>
+        <div class="row" style="margin-top:6px">
+          <input id="passIn" name="pass" type="password" placeholder="password (blank for open networks)" style="flex:1"/>
+          <button type="button" id="passToggle" onclick="togglePassVis()" title="Show/hide password" aria-label="Show password">show</button>
+          <button class="primary" type="submit" id="wifiSaveBtn">Save</button>
+        </div>
+      </form>
+      <div class="warn" id="wifiAddWarn" style="margin-top:8px"></div>
+    </div>
+
+    <div class="row" id="wifiNuke" style="margin-top:10px;display:none">
+      <button class="danger" onclick="forgetAllWifi()">Forget all networks (back to setup)</button>
+    </div>
+  </div>
 
 </main>
 <footer>WeMos D1 Mini + RC522 &middot; AP "WemosRFID" &middot; <span id="ip"></span></footer>
@@ -512,13 +664,64 @@ async function scanWifi(){
     flash('Found ' + list.length + ' networks');
   } catch(e){ flash('Scan failed', true); }
 }
-async function forgetWifi(){
-  if(!confirm('Forget Wi-Fi credentials and reboot? You will need to reconnect to the WemosRFID hotspot.')) return;
+var escHtml = function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); };
+var forgetAllWifi = async function(){
+  if(!confirm('Forget ALL saved Wi-Fi networks and reboot? The device will come up as the WemosRFID hotspot.')) return;
   await api('/api/cmd', {cmd:'wifi-forget'});
-  flash('Forgotten. Device is rebooting — reconnect to the WemosRFID hotspot.');
+  flash('All forgotten. Device is rebooting — reconnect to the WemosRFID hotspot.');
+}
+var removeWifi = async function(idx, ssid){
+  if(!confirm('Remove "'+ssid+'" from saved networks?')) return;
+  const r = await api('/api/cmd', {cmd:'wifi-remove', index:idx});
+  flash(r.message || 'Removed', !r.ok);
+  refresh();
+}
+var renderWifiCard = function(s){
+  const banner = document.getElementById('wifiBanner');
+  const nuke   = document.getElementById('wifiNuke');
+  if (s.netMode === 'station') {
+    banner.innerHTML = 'Connected to <b class="kv">'+escHtml(s.staSSID||'?')+'</b> &middot; IP <span class="kv">'+escHtml(s.staIP||s.ip||'?')+'</span>';
+    nuke.style.display = 'flex';
+  } else {
+    banner.textContent = 'Hotspot mode — pick a saved network below or add one. Saving the first network reboots the device into station mode.';
+    nuke.style.display = 'none';
+  }
+  const list = document.getElementById('wifiSavedList');
+  list.innerHTML = '';
+  const saved = s.savedWifi || [];
+  saved.forEach((ssid, i) => {
+    const li = document.createElement('li');
+    const isCurrent = (s.netMode === 'station' && ssid === s.staSSID);
+    const left = document.createElement('span');
+    left.innerHTML = '<span class="kv">'+escHtml(ssid)+'</span>'+(isCurrent ? ' <span class="tag" style="color:#67e480;border-color:#245d3f">connected</span>' : '');
+    const right = document.createElement('span');
+    const delBtn = document.createElement('button');
+    delBtn.textContent = '✕'; delBtn.className='danger';
+    delBtn.title = 'Remove from saved networks';
+    delBtn.onclick = ()=> removeWifi(i, ssid);
+    right.appendChild(delBtn);
+    li.appendChild(left); li.appendChild(right);
+    list.appendChild(li);
+  });
+  document.getElementById('wifiSavedEmpty').style.display = saved.length ? 'none' : 'block';
+  const max = s.savedWifiMax || 4;
+  document.getElementById('wifiCount').textContent = saved.length + '/' + max;
+  const full = saved.length >= max;
+  const saveBtn = document.getElementById('wifiSaveBtn');
+  const warn = document.getElementById('wifiAddWarn');
+  saveBtn.disabled = full;
+  if (full) {
+    warn.textContent = 'Maximum saved networks reached. Remove one to add another.';
+  } else if (s.netMode === 'station') {
+    saveBtn.textContent = 'Save';
+    warn.textContent = 'Saving keeps the current connection. The new network is tried at the next boot, alongside the others — strongest signal wins.';
+  } else {
+    saveBtn.textContent = 'Save & reboot';
+    warn.textContent = 'Saving reboots the device. On boot it scans, then connects to the strongest in-range saved network. Find it at http://wemosrfid.local once joined; on Android, check your router\'s DHCP leases.';
+  }
 }
 let _scannedOnce = false;
-async function refresh(){
+var refresh = async function(){
   try{
     const s = await api('/api/status');
     document.getElementById('dot').className = 'dot' + (s.present ? ' on':'');
@@ -544,18 +747,8 @@ async function refresh(){
       list.appendChild(li);
     });
     document.getElementById('savedEmpty').style.display = (s.saved && s.saved.length) ? 'none' : 'block';
-    const setupEl = document.getElementById('wifiSetup');
-    const connEl  = document.getElementById('wifiConnected');
-    if (s.netMode === 'station') {
-      setupEl.style.display = 'none';
-      connEl.style.display  = 'block';
-      document.getElementById('staSSID').textContent = s.staSSID || '';
-      document.getElementById('staIP').textContent   = s.staIP || s.ip || '';
-    } else {
-      setupEl.style.display = 'block';
-      connEl.style.display  = 'none';
-      if (!_scannedOnce) { _scannedOnce = true; scanWifi(); }
-    }
+    renderWifiCard(s);
+    if (s.netMode !== 'station' && !_scannedOnce) { _scannedOnce = true; scanWifi(); }
   }catch(e){}
 }
 setInterval(refresh, 700); refresh();
@@ -591,6 +784,14 @@ void handleRoot() {
 void handleStatus() {
   bool present = (op.lastEventMs && (millis() - op.lastEventMs) < 1500);
   String ip = (netMode == NET_STATION) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+
+  String savedWifi = "[";
+  for (uint8_t i = 0; i < wifiCacheN; i++) {
+    if (i) savedWifi += ',';
+    savedWifi += "\"" + escJson(wifiCache[i].ssid) + "\"";
+  }
+  savedWifi += "]";
+
   String json = "{";
   json += "\"present\":" + String(present ? "true" : "false");
   json += ",\"uid\":\"" + op.lastUidHex + "\"";
@@ -601,6 +802,8 @@ void handleStatus() {
   json += ",\"netMode\":\"" + String(netMode == NET_STATION ? "station" : "setup") + "\"";
   json += ",\"staSSID\":\"" + escJson(staSSID) + "\"";
   json += ",\"staIP\":\"" + (netMode == NET_STATION ? WiFi.localIP().toString() : String("")) + "\"";
+  json += ",\"savedWifi\":" + savedWifi;
+  json += ",\"savedWifiMax\":" + String((int)MAX_WIFI_CREDS);
   json += ",\"saved\":" + loadSaved();
   json += "}";
   sendJson(200, json);
@@ -709,11 +912,21 @@ void handleCmd() {
     return;
   }
   if (cmd == "wifi-forget") {
-    Serial.println(F("[CMD] wifi-forget: clearing creds and restarting"));
+    Serial.println(F("[CMD] wifi-forget: clearing all creds and restarting"));
     clearWifiCreds();
-    sendJson(200, "{\"ok\":true,\"message\":\"Wi-Fi forgotten. Rebooting.\"}");
+    sendJson(200, "{\"ok\":true,\"message\":\"All Wi-Fi networks forgotten. Rebooting.\"}");
     delay(400);
     ESP.restart();
+    return;
+  }
+  if (cmd == "wifi-remove") {
+    int idx = field("index").toInt();
+    Serial.printf("[CMD] wifi-remove index=%d\n", idx);
+    if (idx < 0 || !removeWifiCredAt((uint8_t)idx)) {
+      sendJson(200, "{\"ok\":false,\"message\":\"Index out of range.\"}");
+      return;
+    }
+    sendJson(200, "{\"ok\":true,\"message\":\"Network removed.\"}");
     return;
   }
   if (cmd == "write-uid") {
@@ -768,16 +981,16 @@ void handleNotFound() {
 }
 
 void handleWifiSaved() {
-  // Returns a JSON array — single element today (we only persist one set of
-  // creds), but shaped for future multi-network support. Includes the password
-  // in plaintext, consistent with the rest of the unauthenticated API.
+  // Returns a JSON array of saved networks with passwords in plaintext —
+  // consistent with the rest of the unauthenticated API. Index in this array
+  // matches the `index` accepted by `wifi-remove`.
   Serial.printf("[HTTP] GET /api/wifi-saved from %s\n",
                 server.client().remoteIP().toString().c_str());
-  String ssid, pass;
   String json = "[";
-  if (loadWifiCreds(ssid, pass)) {
-    json += "{\"ssid\":\"" + escJson(ssid) + "\",";
-    json += "\"pass\":\"" + escJson(pass) + "\"}";
+  for (uint8_t i = 0; i < wifiCacheN; i++) {
+    if (i) json += ',';
+    json += "{\"ssid\":\"" + escJson(wifiCache[i].ssid) + "\",";
+    json += "\"pass\":\"" + escJson(wifiCache[i].pass) + "\"}";
   }
   json += "]";
   sendJson(200, json);
@@ -819,29 +1032,60 @@ void handleWifiSave() {
     server.send(400, "text/plain", "SSID required");
     return;
   }
-  saveWifiCreds(ssid, pass);
-  Serial.printf("[WiFi] reboot to join '%s'\n", ssid.c_str());
+  int r = upsertWifiCred(ssid, pass);
+  if (r < 0) {
+    String msg = "Saved-network limit reached (" + String((int)MAX_WIFI_CREDS) +
+                 "). Remove one before adding another.";
+    server.send(400, "text/plain", msg);
+    return;
+  }
   String safeSsid = htmlEscape(ssid);
-  String body =
-    "<!doctype html><html><head><meta charset=utf-8>"
-    "<meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>WemosRFID — Wi-Fi saved</title>"
-    "<style>body{margin:0;background:#0e1116;color:#e6e6e6;font:15px/1.5 -apple-system,system-ui,sans-serif;padding:24px;max-width:560px}"
-    "h1{color:#5cc8ff;font-size:20px}code{background:#0b0f14;padding:2px 6px;border-radius:4px}</style>"
-    "</head><body>"
-    "<h1>Wi-Fi saved</h1>"
-    "<p>The device is rebooting and will join <b>" + safeSsid + "</b>. The "
-    "<i>WemosRFID</i> hotspot will disappear in a few seconds — your phone may "
-    "switch back to its previous network automatically.</p>"
-    "<p>Once joined, find the device at <code>http://wemosrfid.local</code> "
-    "(macOS, iOS, Linux, Windows 10+) or <code>\\\\WEMOSRFID</code> from "
-    "Windows Explorer. On Android, look at your router's DHCP leases.</p>"
-    "<p>If the credentials are wrong, the device will fall back to the "
-    "<i>WemosRFID</i> hotspot after about 15 seconds — reconnect and try again.</p>"
-    "</body></html>";
+  bool reboot = (netMode == NET_SETUP_AP);
+  Serial.printf("[WiFi] saved '%s' (%s); will %s\n",
+                ssid.c_str(), r == 1 ? "added" : "updated",
+                reboot ? "reboot to join" : "keep current connection");
+
+  String body;
+  if (reboot) {
+    body =
+      "<!doctype html><html><head><meta charset=utf-8>"
+      "<meta name=viewport content='width=device-width,initial-scale=1'>"
+      "<title>WemosRFID — Wi-Fi saved</title>"
+      "<style>body{margin:0;background:#0e1116;color:#e6e6e6;font:15px/1.5 -apple-system,system-ui,sans-serif;padding:24px;max-width:560px}"
+      "h1{color:#5cc8ff;font-size:20px}code{background:#0b0f14;padding:2px 6px;border-radius:4px}</style>"
+      "</head><body>"
+      "<h1>Wi-Fi saved</h1>"
+      "<p>The device is rebooting. On boot, it scans visible networks and joins "
+      "the saved one with the strongest signal — likely <b>" + safeSsid + "</b> "
+      "if it's in range. The <i>WemosRFID</i> hotspot will disappear; your phone "
+      "may switch back to its previous network automatically.</p>"
+      "<p>Once joined, find the device at <code>http://wemosrfid.local</code> "
+      "(macOS, iOS, Linux, Windows 10+) or <code>\\\\WEMOSRFID</code> from "
+      "Windows Explorer. On Android, look at your router's DHCP leases.</p>"
+      "<p>If no saved network is reachable, the device falls back to the "
+      "<i>WemosRFID</i> hotspot after about 15 seconds — reconnect and try again.</p>"
+      "</body></html>";
+  } else {
+    body =
+      "<!doctype html><html><head><meta charset=utf-8>"
+      "<meta name=viewport content='width=device-width,initial-scale=1'>"
+      "<title>WemosRFID — Wi-Fi saved</title>"
+      "<meta http-equiv=refresh content='2;url=/'>"
+      "<style>body{margin:0;background:#0e1116;color:#e6e6e6;font:15px/1.5 -apple-system,system-ui,sans-serif;padding:24px;max-width:560px}"
+      "h1{color:#5cc8ff;font-size:20px}a{color:#5cc8ff}</style>"
+      "</head><body>"
+      "<h1>Wi-Fi saved</h1>"
+      "<p><b>" + safeSsid + "</b> has been added to the saved networks list. "
+      "The current connection is unchanged — the new network will be tried at "
+      "the next boot, alongside the others, with the strongest signal winning.</p>"
+      "<p>Returning to <a href=/>controls</a>…</p>"
+      "</body></html>";
+  }
   server.send(200, "text/html", body);
-  delay(500);
-  ESP.restart();
+  if (reboot) {
+    delay(500);
+    ESP.restart();
+  }
 }
 
 // ---- Main loop card processing --------------------------------------------
@@ -943,17 +1187,16 @@ void setup() {
     LittleFS.format();
     LittleFS.begin();
   }
+  syncWifiCache();
 
   WiFi.persistent(false);
 
-  String savedSsid, savedPass;
-  if (loadWifiCreds(savedSsid, savedPass) && tryConnectSTA(savedSsid, savedPass)) {
+  if (tryConnectAny()) {
     netMode = NET_STATION;
-    staSSID = savedSsid;
     Serial.printf("[STA] joined '%s' IP=%s\n",
-                  savedSsid.c_str(), WiFi.localIP().toString().c_str());
+                  staSSID.c_str(), WiFi.localIP().toString().c_str());
   } else {
-    if (savedSsid.length()) Serial.println(F("[STA] saved creds failed, falling back to setup AP"));
+    Serial.println(F("[STA] no saved networks reachable, falling back to setup AP"));
     WiFi.disconnect(false);
     // AP_STA (not pure AP) so handleWifiScan() can use the STA radio while we
     // host the setup hotspot.

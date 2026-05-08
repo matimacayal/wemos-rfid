@@ -7,10 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Single-file Arduino sketch (`WemosRFID.ino`) for a **WeMos D1 Mini (ESP8266)** + **MFRC522 (RC522)** RFID reader. The board serves a self-contained web UI for reading/cloning/writing 13.56 MHz cards. There is no separate frontend build, no SD card, no filesystem upload — the UI is a PROGMEM string literal compiled into the firmware.
 
 The device runs in one of two network modes (`NetMode` enum):
-- `NET_SETUP_AP` — first boot, no creds, or saved creds failed. Hosts the `WemosRFID` hotspot in `WIFI_AP_STA` (STA leg kept alive only so `WiFi.scanNetworks()` works during provisioning).
-- `NET_STATION` — joined the saved external Wi-Fi from `/wifi.txt` (line 1 SSID, line 2 password). On STA failure within `STA_CONNECT_TIMEOUT_MS` (15 s), `setup()` falls back to `NET_SETUP_AP`.
+- `NET_SETUP_AP` — first boot, no creds, or no saved network was reachable. Hosts the `WemosRFID` hotspot in `WIFI_AP_STA` (STA leg kept alive only so `WiFi.scanNetworks()` works during provisioning).
+- `NET_STATION` — joined one of the saved external Wi-Fis from `/wifi.txt` (paired lines: ssid1, pass1, ssid2, pass2, ... up to `MAX_WIFI_CREDS = 4`). On boot, `tryConnectAny()` scans for visible APs, intersects with saved networks, sorts by RSSI desc, and tries each in turn — `STA_CONNECT_TIMEOUT_MS` (15 s) is the **per-network** timeout. Networks not visible in the scan are skipped, so worst-case boot time scales with `(visible-saved-count × 15 s)`, not `(saved-count × 15 s)`.
 
-Both modes serve the same `INDEX_HTML`; the JS shows/hides the **Network** card sections based on `s.netMode` from `/api/status`. mDNS (`wemosrfid.local`) and NetBIOS (`\\WEMOSRFID`) are advertised in both modes.
+Both modes serve the same `INDEX_HTML`; the JS renders the **Network** card based on `s.netMode`, `s.savedWifi` (array of SSIDs), and `s.staSSID` from `/api/status`. mDNS (`wemosrfid.local`) and NetBIOS (`\\WEMOSRFID`) are advertised in both modes.
 
 ## Build & flash
 
@@ -31,8 +31,9 @@ This means a "command" is a two-step interaction: the POST queues intent, the ne
 
 **Wi-Fi handlers are the exception** — they bypass the OpState machine because they don't touch the RC522:
 - `handleWifiScan` (`GET /api/wifi-scan`) calls `WiFi.scanNetworks()` synchronously (blocks 2–3 s).
-- `handleWifiSave` (`POST /api/wifi-save`) accepts a regular form-encoded post (`server.arg("ssid"/"pass")`) — chosen so setup works even with broken JS — writes `/wifi.txt`, then `ESP.restart()`.
-- The `wifi-forget` command in `handleCmd` clears `/wifi.txt` and restarts.
+- `handleWifiSave` (`POST /api/wifi-save`) accepts form-encoded `ssid`/`pass` (chosen so setup works even with broken JS), then calls `upsertWifiCred()` (matches by SSID — appends or replaces password). Reboot behavior depends on mode: in setup AP mode it `ESP.restart()`s so the device tries to join the new network; in station mode it does NOT reboot — the saved entry is just persisted and tried on next boot, alongside any existing saved networks.
+- The `wifi-remove` command in `handleCmd` removes one entry by index (matches the order returned by `/api/wifi-saved` and `/api/status` `savedWifi`); does **not** reboot — the user can remove a saved network without dropping the current connection.
+- The `wifi-forget` command in `handleCmd` clears the entire file (`clearWifiCreds()`) and restarts.
 
 **Embedded UI.** The single-page app lives in `INDEX_HTML[] PROGMEM` inside the `.ino`. Editing HTML/CSS/JS = editing C++. The UI is served by `handleRoot()` via `server.send_P`, and only `/`, `/api/status`, `/api/cmd` are routed.
 
@@ -42,7 +43,7 @@ This means a "command" is a two-step interaction: the POST queues intent, the ne
 
 **LittleFS layout:**
 - `/saved.json` — JSON array of UID strings (manipulated as raw text, see above).
-- `/wifi.txt` — two-line plain text: SSID, then password. Avoids JSON parsing for credentials and tolerates `"`/`\` in passwords. Created by `saveWifiCreds`, deleted by `clearWifiCreds`.
+- `/wifi.txt` — paired-line plain text: `ssid1\npass1\nssid2\npass2\n...` (up to `MAX_WIFI_CREDS = 4` entries). Avoids JSON parsing for credentials and tolerates `"`/`\` in passwords. Round-tripped by `loadAllWifiCreds` / `saveAllWifiCreds`; mutated by `upsertWifiCred` (match by SSID) and `removeWifiCredAt` (match by index); cleared by `clearWifiCreds`. **Caveat:** passwords can't contain raw `\n`, since the file is line-delimited (in practice WPA2 passphrases don't).
 
 ## Hardware-tied constants
 
@@ -54,7 +55,8 @@ This means a "command" is a two-step interaction: the POST queues intent, the ne
 
 - **AP password is `rfidwemos`** (not `rfidtools` as some older docs claim). Set in [WemosRFID.ino](WemosRFID.ino) as `AP_PASS`.
 - **STA scan requires AP_STA mode.** The setup hotspot uses `WIFI_AP_STA` rather than pure `WIFI_AP` so `WiFi.scanNetworks()` works during provisioning. Don't switch it back to `WIFI_AP` without moving the scan elsewhere.
-- **Bricking yourself out** — entering wrong creds is recoverable (15 s STA timeout → falls back to setup AP), but a *valid SSID with a wrong password* can sometimes cause `WL_CONNECT_FAILED` quickly enough that you don't get locked out. The "Forget Wi-Fi" button (`wifi-forget` cmd) is the in-band escape hatch; if the device is unreachable, reflash `/wifi.txt` via Arduino IDE's LittleFS uploader or wipe the FS and reformat.
+- **Bricking yourself out** — entering wrong creds is recoverable. Each saved network is tried in turn with a 15 s timeout, so if you have e.g. home + office saved and only home is in range, only home is attempted. Even if all in-range candidates fail, the device falls back to the setup AP. The "Forget all networks" button (`wifi-forget` cmd) is the in-band nuclear option; "✕" next to a saved network triggers `wifi-remove` (does not reboot). If the device is unreachable, reflash `/wifi.txt` via Arduino IDE's LittleFS uploader or wipe the FS and reformat.
+- **Multi-network connect order is RSSI-descending, not save-order.** The strongest in-range signal wins. Two saved networks at the same site means the device connects to whichever has better signal at boot — usually fine, but if you've moved between sites you may end up on a different network than expected.
 - **UID write only works on "magic" Gen1A** MIFARE Classic cards. `MFRC522::MIFARE_SetUid` will fail silently-ish on genuine cards — surfaced as `"Write failed. Card likely not a magic Gen1A card."`. Also, `MODE_WRITE_UID` / `MODE_CLONE_WRITE_DST` reject 7-byte UIDs (`pendingUidLen != 4`) even though `write-uid` validation accepts 4 or 7 — the magic-card protocol used here is 4-byte only.
 - **Dump uses default key A `FF FF FF FF FF FF`** for every sector. Sectors with custom keys print `auth failed` and are skipped. Custom-key support is not implemented.
 - **Block-write guardrails** in `handleCmd()` reject blocks `<1`, `>62`, or `% 4 == 3` (sector trailers). Block 0 is also blocked because writing it on non-magic cards bricks auth.

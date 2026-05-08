@@ -679,6 +679,12 @@ ul.saved li:last-child{border:0}
 .flash{padding:8px 12px;border-radius:6px;background:#173a2a;border:1px solid #245d3f;color:#cdebd5}
 .flash.err{background:#3a1d1d;border-color:#7a2c2c;color:#f3c8c8}
 .warn{background:#3a2f12;border:1px solid #75590f;border-radius:6px;padding:8px 10px;color:#e9d8a3;font-size:13px}
+.tabs{display:flex;gap:2px;border-bottom:1px solid #222;margin:-4px -4px 12px}
+.tabs button{background:transparent;border:0;border-bottom:2px solid transparent;border-radius:0;padding:8px 12px;color:var(--mut);font-size:13px;text-transform:uppercase;letter-spacing:.04em}
+.tabs button:hover{color:var(--fg);border-bottom-color:#2c3340}
+.tabs button.active{color:var(--acc);border-bottom-color:var(--acc)}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
 .spacing{padding:8px 12px;border-radius:6px;background:#173a2a;border:1px solid #245d3f;color:#cdebd5}
 footer{padding:16px;color:var(--mut);text-align:center;font-size:12px}
 </style>
@@ -699,47 +705,50 @@ footer{padding:16px;color:var(--mut);text-align:center;font-size:12px}
   <div id="flash"></div>
 
   <div class="card">
-    <h2>Read</h2>
-    <div class="row">
-      <button class="primary" onclick="cmd('read')">Read UID</button>
-      <button onclick="cmd('dump')">Full Memory Dump (MIFARE 1K)</button>
-      <button onclick="saveUid()">Save UID to library</button>
+    <div class="tabs">
+      <button class="tab active" data-tab="read"  onclick="showTab('read')">Read</button>
+      <button class="tab"        data-tab="clone" onclick="showTab('clone')">Clone</button>
+      <button class="tab"        data-tab="wuid"  onclick="showTab('wuid')">Write UID</button>
+      <button class="tab"        data-tab="wblk"  onclick="showTab('wblk')">Write Block</button>
     </div>
-    <!--
-    <div class="row" style="margin-top:6px">
-      <button onclick="saveUid()">Save UID to library</button>
-      <input id="saveName" type="text" placeholder="optional name (e.g. home key)" style="flex:1" maxlength="40"/>
-    </div>
-    <pre id="dump" style="display:none"></pre>
-    -->
-  </div>
 
-  <div class="card">
-    <h2>Clone</h2>
-    <div class="muted">Reads the UID from a source card, then writes it to a magic (UID-changeable) target card.</div>
-    <div class="row" style="margin-top:8px">
-      <button class="primary" onclick="cmd('clone-start')">Start Clone</button>
-      <button onclick="cmd('cancel')">Cancel</button>
+    <div class="tab-panel active" id="tab-read">
+      <div class="row">
+        <button class="primary" onclick="cmd('read')">Read UID</button>
+        <button onclick="cmd('dump')">Full Memory Dump (MIFARE 1K)</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button onclick="saveUid()">Save UID to library</button>
+        <input id="saveName" type="text" placeholder="optional name (e.g. home key)" style="flex:1" maxlength="40"/>
+      </div>
+      <pre id="dump" style="display:none"></pre>
     </div>
-  </div>
 
-  <div class="card">
-    <h2>Write UID</h2>
-    <div class="row">
-      <input id="uidIn" type="text" placeholder="DE AD BE EF" maxlength="29"/>
-      <button class="primary" onclick="writeUid()">Write to next card</button>
+    <div class="tab-panel" id="tab-clone">
+      <div class="muted">Reads the UID from a source card, then writes it to a magic (UID-changeable) target card.</div>
+      <div class="row" style="margin-top:8px">
+        <button class="primary" onclick="cmd('clone-start')">Start Clone</button>
+        <button onclick="cmd('cancel')">Cancel</button>
+      </div>
     </div>
-    <div class="warn" style="margin-top:8px">Requires a "magic" Gen1A UID-changeable MIFARE Classic card. Standard cards have a permanent UID.</div>
-  </div>
 
-  <div class="card">
-    <h2>Write Block (MIFARE 1K, default keys)</h2>
-    <div class="row">
-      <input id="blkIn" type="text" placeholder="block (4..62, avoid 0/trailers)" style="max-width:220px"/>
-      <input id="dataIn" type="text" placeholder="16-byte hex, e.g. 00 11 22 .. (32 hex chars)"/>
+    <div class="tab-panel" id="tab-wuid">
+      <div class="row">
+        <input id="uidIn" type="text" placeholder="DE AD BE EF" maxlength="29"/>
+        <button class="primary" onclick="writeUid()">Write to next card</button>
+      </div>
+      <div class="warn" style="margin-top:8px">Requires a "magic" Gen1A UID-changeable MIFARE Classic card. Standard cards have a permanent UID.</div>
     </div>
-    <div class="row" style="margin-top:6px">
-      <button class="primary" onclick="writeBlock()">Write to next card</button>
+
+    <div class="tab-panel" id="tab-wblk">
+      <div class="muted">MIFARE 1K, default keys. Avoid block 0 and sector trailers.</div>
+      <div class="row" style="margin-top:8px">
+        <input id="blkIn" type="text" placeholder="block (4..62, avoid 0/trailers)" style="max-width:220px"/>
+        <input id="dataIn" type="text" placeholder="16-byte hex, e.g. 00 11 22 .. (32 hex chars)"/>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button class="primary" onclick="writeBlock()">Write to next card</button>
+      </div>
     </div>
   </div>
 
@@ -761,25 +770,31 @@ footer{padding:16px;color:var(--mut);text-align:center;font-size:12px}
       <div class="muted" id="wifiSavedEmpty" style="display:none">No saved networks yet — add one below.</div>
     </div>
 
-    <div id="wifiAdd" style="margin-top:12px">
-      <div class="muted" style="margin-bottom:6px">Add a network <span id="wifiCount" class="tag"></span></div>
-      <form method="POST" action="/api/wifi-save">
-        <div class="row">
-          <input list="ssidList" name="ssid" placeholder="SSID" autocomplete="off" required style="flex:1"/>
-          <button type="button" onclick="scanWifi()">Scan</button>
-        </div>
-        <datalist id="ssidList"></datalist>
-        <div class="row" style="margin-top:6px">
-          <input id="passIn" name="pass" type="password" placeholder="password (blank for open networks)" style="flex:1"/>
-          <button type="button" id="passToggle" onclick="togglePassVis()" title="Show/hide password" aria-label="Show password">show</button>
-          <button class="primary" type="submit" id="wifiSaveBtn">Save</button>
-        </div>
-      </form>
-      <div class="warn" id="wifiAddWarn" style="margin-top:8px"></div>
+    <div class="row" style="margin-top:10px">
+      <button type="button" id="wifiMoreBtn" onclick="toggleWifiMore()" aria-expanded="false">More options &#9656;</button>
     </div>
 
-    <div class="row" id="wifiNuke" style="margin-top:10px;display:none">
-      <button class="danger" onclick="forgetAllWifi()">Forget all networks (back to setup)</button>
+    <div id="wifiMore" style="display:none">
+      <div id="wifiAdd" style="margin-top:12px">
+        <div class="muted" style="margin-bottom:6px">Add a network <span id="wifiCount" class="tag"></span></div>
+        <form method="POST" action="/api/wifi-save">
+          <div class="row">
+            <input list="ssidList" name="ssid" placeholder="SSID" autocomplete="off" required style="flex:1"/>
+            <button type="button" onclick="scanWifi()">Scan</button>
+          </div>
+          <datalist id="ssidList"></datalist>
+          <div class="row" style="margin-top:6px">
+            <input id="passIn" name="pass" type="password" placeholder="password (blank for open networks)" style="flex:1"/>
+            <button type="button" id="passToggle" onclick="togglePassVis()" title="Show/hide password" aria-label="Show password">show</button>
+            <button class="primary" type="submit" id="wifiSaveBtn">Save</button>
+          </div>
+        </form>
+        <div class="warn" id="wifiAddWarn" style="margin-top:8px"></div>
+      </div>
+
+      <div class="row" id="wifiNuke" style="margin-top:10px;display:none">
+        <button class="danger" onclick="forgetAllWifi()">Forget all networks (back to setup)</button>
+      </div>
     </div>
   </div>
 
@@ -850,6 +865,20 @@ async function scanWifi(){
   } catch(e){ flash('Scan failed', true); }
 }
 var escHtml = function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); };
+var showTab = function(name){
+  var btns = document.querySelectorAll('.tabs .tab');
+  for (var i=0;i<btns.length;i++) btns[i].classList.toggle('active', btns[i].dataset.tab === name);
+  var panels = document.querySelectorAll('.tab-panel');
+  for (var j=0;j<panels.length;j++) panels[j].classList.toggle('active', panels[j].id === 'tab-' + name);
+};
+var toggleWifiMore = function(){
+  var box = document.getElementById('wifiMore');
+  var btn = document.getElementById('wifiMoreBtn');
+  var open = box.style.display !== 'none';
+  box.style.display = open ? 'none' : 'block';
+  btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+  btn.innerHTML = open ? 'More options \u25B8' : 'Hide options \u25BE';
+};
 var forgetAllWifi = async function(){
   if(!confirm('Forget ALL saved Wi-Fi networks and reboot? The device will come up as the WemosRFID hotspot.')) return;
   await api('/api/cmd', {cmd:'wifi-forget'});
@@ -906,6 +935,7 @@ var renderWifiCard = function(s){
   }
 }
 let _scannedOnce = false;
+let _lastStatus;
 var refresh = async function(){
   try{
     const s = await api('/api/status');
@@ -914,6 +944,10 @@ var refresh = async function(){
     document.getElementById('uid').textContent = s.uid || '--';
     document.getElementById('ctype').textContent = s.cardType || '';
     document.getElementById('status').textContent = s.status || '';
+    if (s.status && s.status !== _lastStatus) {
+      if (_lastStatus !== undefined) flash(s.status);
+      _lastStatus = s.status;
+    }
     document.getElementById('ip').textContent = s.ip || '';
     const list = document.getElementById('saved');
     list.innerHTML = '';
